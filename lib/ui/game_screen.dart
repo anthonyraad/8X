@@ -4,6 +4,10 @@ import 'dart:math';
 import 'dart:async';
 import 'card_widget.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
 
 class GameScreen extends StatefulWidget {
   const GameScreen({super.key});
@@ -18,102 +22,1828 @@ class _GameScreenState extends State<GameScreen> {
   late List<String> opponentDeck;
   late List<String> playerHand;
   late List<String> opponentHand;
+  late List<String> opponentActualHand; // Store real opponent cards locally
   late List<String> playerPrizeCards;
   late List<String> opponentPrizeCards;
   late List<String> playerDrawPile;
   late List<String> opponentDrawPile;
+  late List<String>
+      opponentActualDrawPile; // Store real opponent draw pile locally
   List<String> field = [];
   List<String> activityLog = [];
+  Set<String> processedTimeoutPenalties = <String>{};
+
+// Firebase multiplayer variables
+  String gameMode = 'ai'; // 'ai' or 'human'
+  bool showRoomSelection = false;
+  bool showCreateRoom = false;
+  bool showJoinRoom = false;
+  bool isSearchingForGame = false; // Quick match state
+  String? roomCode;
+  String? playerId;
+  String? opponentId;
+  List<String> playedCards = [];
+  bool isHost = false;
+  bool waitingForOpponent = false;
+  bool _isUpdatingFirebase = false;
+  String connectionStatus = '';
+  StreamSubscription<DatabaseEvent>? gameSubscription;
+  StreamSubscription<DatabaseEvent>? quickMatchSubscription; // For monitoring quick match
+  final TextEditingController roomCodeController = TextEditingController();
+  int? lastKnownOpponentHandSize;
+  int? lastKnownOpponentDrawPileSize;
+  List<String> backgrounds = [
+    'assets/images/playmat1.png',
+    'assets/images/playmat2.png',
+    'assets/images/playmat3.png'
+  ];
+  int currentBackgroundIndex = 0;
+  bool isTransitioning = false;
 
   int aiDifficulty = 1; // 1 = Easy, 2 = Medium, 3 = Hard
   int winStreak = 0;
+  int highScore = 0;
+
 
   bool isPlayerTurn = true;
   bool gameOver = false;
-  bool showInitialOverlay = true; // NEW: Track initial overlay state
+  bool showInitialOverlay = true;
   bool showRules = false;
+  bool _waitingForRematch = false;
+  bool _aceDialogOpen = false;
+  bool _isOpponentTurnRunning = false;
+
   String message = '';
   List<int> selectedIndices = [];
   List<String> selectedOps = [];
   int playerMaxHandSize = 2;
   Timer? turnTimer;
   int timerSeconds = 8;
+  int currentHandSize = 2;
+  Map<String, int> playedCardCounts = {}; // Track all cards played
+  List<String> gameHistory = []; // Complete sequence of plays
+  Map<String, int> playerPlayPatterns =
+      {}; // Track player's card usage patterns
+  int totalCardsPlayed = 0;
+  List<int?> fieldAceValueHistory = []; // Track ace values as cards are played
 
   String? winner; // 'player', 'opponent', or null
 
-  final AudioPlayer _audioPlayer = AudioPlayer();
+  Map<String, bool> playerModifiers = {
+    'mulligan': false,
+    '2x': false,
+    '+3': false,
+    '-3': false,
+    '-1': false,
+    '+1': false,
+    '+11': false,
+    'draw1': false,
+    '-0.5': false,
+    'rewind': false,
+  };
 
-  // --- NEW: Track the value of the Ace on the field ---
-  int? fieldAceValue; // null if not an Ace, 1 or 14 if Ace
+  Map<String, bool> opponentModifiers = {
+    'mulligan': false,
+    '2x': false,
+    '+3': false,
+    '-3': false,
+    '-1': false,
+    '+1': false,
+    '+11': false,
+    'draw1': false,
+    '-0.5': false,
+    'rewind': false,
+  };
 
-  // --- Defensive Helper Methods ---
+  String? activePlayerModifier; // Currently selected modifier for this turn
+  bool showModifierSelection = false;
 
-  /// Safely removes cards from hand using indices in reverse order
-  void safeRemoveFromHand(
-    List<String> hand,
-    List<int> indices,
-    String handName,
-  ) {
-    // Validate all indices first
-    for (int i = 0; i < indices.length; i++) {
-      if (indices[i] < 0 || indices[i] >= hand.length) {
-        print(
-          'ERROR: Index ${indices[i]} out of bounds for $handName (length: ${hand.length})',
-        );
-        return; // Don't proceed if any index is invalid
+  List<String> playerAvailableModifiers = [];
+  List<String> opponentAvailableModifiers = [];
+
+// All possible modifiers
+  static const List<String> allModifiers = [
+    'mulligan',
+    '2x',
+    '+3',
+    '-3',
+    '-1',
+    '+1',
+    '+11',
+    'draw1',
+    '-0.5',
+    'rewind'
+  ];
+
+  String? appliedModifier;
+
+//Sanitize modifier keys for Firebase
+  Map<String, String> _sanitizeModifierKey(String modifier) {
+    // Convert problematic characters for Firebase keys
+    final Map<String, String> keyMapping = {
+      '-0.5': 'minusHalf',
+      '2x': 'double',
+      '+3': 'plusThree',
+      '-3': 'minusThree',
+      '+1': 'plusOne',
+      '-1': 'minusOne',
+      '+11': 'plusEleven',
+      'draw1': 'drawOne',
+      'rewind': 'rewind',
+      'mulligan': 'mulligan',
+    };
+
+    return keyMapping;
+  }
+
+  String _sanitizeModifierForFirebase(String modifier) {
+    final mapping = _sanitizeModifierKey(modifier);
+    return mapping[modifier] ?? modifier;
+  }
+
+  String _unsanitizeModifierFromFirebase(String sanitizedModifier) {
+    final mapping = _sanitizeModifierKey('');
+    for (String key in mapping.keys) {
+      if (mapping[key] == sanitizedModifier) {
+        return key;
       }
     }
+    return sanitizedModifier;
+  }
 
-    // Sort indices in descending order to maintain validity during removal
-    List<int> sortedIndices = List.from(indices)
-      ..sort((a, b) => b.compareTo(a));
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  final AudioPlayer _tapAudioPlayer = AudioPlayer();
+  final AudioPlayer _gameOverAudioPlayer = AudioPlayer();
 
-    // Remove cards
-    for (int index in sortedIndices) {
-      hand.removeAt(index);
+  int? fieldAceValue;
+
+  Color activityLogColor = const Color.fromARGB(245, 255, 255, 255);
+
+Future<void> _loadHighScore() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      highScore = prefs.getInt('winStreakHighScore') ?? 0;
+    });
+    print('Loaded high score: $highScore');
+  } catch (e) {
+    print('Error loading high score: $e');
+    highScore = 0;
+  }
+}
+
+// Save high score to persistent storage
+Future<void> _saveHighScore(int score) async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('winStreakHighScore', score);
+    print('Saved high score: $score');
+  } catch (e) {
+    print('Error saving high score: $e');
+  }
+}
+
+// Check and update high score if current streak is higher
+void _checkAndUpdateHighScore() {
+  if (winStreak > highScore) {
+    setState(() {
+      highScore = winStreak;
+    });
+    _saveHighScore(highScore);
+  }
+}
+
+// Firebase methods
+  void _generatePlayerId() {
+    playerId =
+        'player_${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(1000)}';
+  }
+
+  String _generateRoomCode() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    return String.fromCharCodes(Iterable.generate(
+        3, (_) => chars.codeUnitAt(Random().nextInt(chars.length))));
+  }
+
+  void _prepareForMultiplayer() {
+    print('DEBUG: Preparing for multiplayer transition');
+
+    // Cancel any active AI timers
+    turnTimer?.cancel();
+
+    // Cancel any existing Firebase subscriptions
+    gameSubscription?.cancel();
+
+    // Reset all game state
+    _resetGameState();
+    _resetMultiplayerState();
+
+    // Clear any pending AI operations
+    // (In case opponentTurn was scheduled)
+
+    setState(() {
+      // Ensure we're in a clean state
+      gameOver = false;
+      isPlayerTurn = false;
+      showInitialOverlay = true;
+      waitingForOpponent = false;
+      message = '';
+      _waitingForRematch = false;
+
+      // Clear selections
+      clearSelections();
+    });
+
+    print('DEBUG: Multiplayer preparation complete');
+  }
+
+// Quick Match - Search for an open game or create one
+  Future<void> _searchForGame() async {
+    // Light preparation - don't use _prepareForMultiplayer() as it resets too much
+    turnTimer?.cancel();
+    gameSubscription?.cancel();
+    quickMatchSubscription?.cancel();
+    
+    setState(() {
+      // Set up for quick match
+      isSearchingForGame = true;
+      waitingForOpponent = false;
+      showRoomSelection = false;
+      showInitialOverlay = false; // Hide the Play button overlay
+      showCreateRoom = false;
+      showJoinRoom = false;
+      gameMode = 'human'; // Set to human mode immediately
+      connectionStatus = 'Searching for opponent...';
+      gameOver = false;
+    });
+
+    try {
+      _generatePlayerId();
+      
+      // Query for any room that is waiting and is a quick match room
+      final DatabaseReference roomsRef = FirebaseDatabase.instance.ref('rooms');
+      final snapshot = await roomsRef
+          .orderByChild('gameState')
+          .equalTo('waiting')
+          .limitToFirst(10)
+          .get();
+
+      String? foundRoomCode;
+      
+      if (snapshot.exists) {
+        final rooms = snapshot.value as Map<dynamic, dynamic>;
+        final now = DateTime.now().millisecondsSinceEpoch;
+        
+        // Find a suitable quick match room (not our own, not too old)
+        for (var entry in rooms.entries) {
+          final roomData = entry.value as Map<dynamic, dynamic>;
+          final isQuickMatch = roomData['isQuickMatch'] as bool? ?? false;
+          final createdAt = roomData['createdAt'] as int? ?? 0;
+          final host = roomData['host'] as String?;
+          final players = roomData['players'] as Map<dynamic, dynamic>? ?? {};
+          
+          // Room must be: quick match, less than 2 minutes old, has 1 player, not ours
+          final isRecent = (now - createdAt) < 120000; // 2 minutes
+          final hasOnePlayer = players.length == 1;
+          final isNotOurs = host != playerId;
+          
+          if (isQuickMatch && isRecent && hasOnePlayer && isNotOurs) {
+            foundRoomCode = entry.key as String;
+            break;
+          }
+        }
+      }
+
+      if (foundRoomCode != null) {
+        // Found an open room - join it
+        print('DEBUG: Found quick match room: $foundRoomCode');
+        await _joinQuickMatchRoom(foundRoomCode);
+      } else {
+        // No room found - create one
+        print('DEBUG: No quick match room found, creating one');
+        await _createQuickMatchRoom();
+      }
+    } catch (e) {
+      print('Error in quick match: $e');
+      setState(() {
+        connectionStatus = 'Error finding game: $e';
+        isSearchingForGame = false;
+      });
+      _resetToAIMode();
     }
   }
 
-  /// Safely accesses list elements with bounds checking
+  Future<void> _createQuickMatchRoom() async {
+    try {
+      roomCode = _generateRoomCode();
+      isHost = true;
+      gameMode = 'human';
+
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      await roomRef.set({
+        'host': playerId,
+        'players': {playerId!: true},
+        'gameState': 'waiting',
+        'isQuickMatch': true, // Mark as quick match room
+        'createdAt': ServerValue.timestamp, // For stale room cleanup
+        'turn': playerId,
+        'field': [],
+        'activityLog': [],
+        'fieldAceValue': null,
+        'gameData': {'playerDecks': {}},
+        'playerHands': {},
+        'playerPrizeCards': {},
+        'playerDrawPiles': {},
+        'handSizes': {},
+        'prizeCardCounts': {},
+        'drawPileSizes': {},
+        'modifierAssignments': {},
+      });
+
+      setState(() {
+        waitingForOpponent = true;
+        showInitialOverlay = false; // Ensure Play button overlay is hidden
+        connectionStatus = 'Waiting for opponent...';
+      });
+
+      _listenToRoom();
+    } catch (e) {
+      print('Error creating quick match room: $e');
+      setState(() {
+        connectionStatus = 'Error creating game: $e';
+        isSearchingForGame = false;
+      });
+      _resetToAIMode();
+    }
+  }
+
+  Future<void> _joinQuickMatchRoom(String code) async {
+    try {
+      roomCode = code;
+      isHost = false;
+      gameMode = 'human';
+
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      // Use transaction to prevent race condition
+      final result = await roomRef.runTransaction((data) {
+        if (data == null) return Transaction.abort();
+        
+        final roomData = data as Map<dynamic, dynamic>;
+        final players = roomData['players'] as Map<dynamic, dynamic>? ?? {};
+        
+        // Check room is still valid
+        if (players.length >= 2 || roomData['gameState'] != 'waiting') {
+          return Transaction.abort();
+        }
+        
+        // Add ourselves to the room
+        players[playerId!] = true;
+        roomData['players'] = players;
+        
+        return Transaction.success(roomData);
+      });
+
+      if (!result.committed) {
+        // Room was taken, search again
+        print('DEBUG: Room was taken, searching again');
+        await _searchForGame();
+        return;
+      }
+
+      // Get host's player ID for opponent tracking
+      final snapshot = await roomRef.get();
+      if (snapshot.exists) {
+        final data = snapshot.value as Map<dynamic, dynamic>;
+        final hostId = data['host'] as String?;
+        if (hostId != null && hostId != playerId) {
+          opponentId = hostId;
+        }
+      }
+
+      setState(() {
+        waitingForOpponent = true;
+        showInitialOverlay = false; // Ensure Play button overlay is hidden
+        connectionStatus = 'Joining game...';
+      });
+
+      _listenToRoom();
+    } catch (e) {
+      print('Error joining quick match room: $e');
+      // Try searching again
+      await _searchForGame();
+    }
+  }
+
+  void _cancelQuickMatch() {
+    quickMatchSubscription?.cancel();
+    quickMatchSubscription = null;
+    
+    // If we created a room, delete it
+    if (isHost && roomCode != null) {
+      FirebaseDatabase.instance.ref('rooms/$roomCode').remove();
+    }
+    
+    setState(() {
+      isSearchingForGame = false;
+      waitingForOpponent = false;
+      connectionStatus = '';
+      roomCode = null;
+    });
+    
+    _resetToAIMode();
+  }
+
+// Update your _createRoom method
+  Future<void> _createRoom() async {
+    _prepareForMultiplayer();
+
+    try {
+      _generatePlayerId();
+      roomCode = _generateRoomCode();
+      isHost = true;
+      gameMode = 'human';
+
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      // Initialize basic room structure (modifiers will be assigned when game starts)
+      await roomRef.set({
+        'host': playerId,
+        'players': {playerId!: true},
+        'gameState': 'waiting',
+        'turn': playerId,
+        'field': [],
+        'activityLog': [],
+        'fieldAceValue': null,
+        'gameData': {'playerDecks': {}},
+        'playerHands': {},
+        'playerPrizeCards': {},
+        'playerDrawPiles': {},
+        'handSizes': {},
+        'prizeCardCounts': {},
+        'drawPileSizes': {},
+        'modifierAssignments':
+            {}, // Initialize empty - will be set when game starts
+      });
+
+      setState(() {
+        waitingForOpponent = true;
+        connectionStatus = 'Room created: $roomCode';
+        showCreateRoom = true;
+        showRoomSelection = false;
+        gameMode = 'human';
+      });
+
+      _listenToRoom();
+    } catch (e) {
+      setState(() {
+        connectionStatus = 'Error creating room: $e';
+      });
+      _resetToAIMode();
+    }
+  }
+
+// Update your _joinRoom method
+  Future<void> _joinRoom(String code) async {
+    // Clean up any existing game state first
+    _prepareForMultiplayer();
+
+    try {
+      _generatePlayerId();
+      roomCode = code.toUpperCase();
+      isHost = false;
+      gameMode = 'human';
+
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      final snapshot = await roomRef.get();
+      if (!snapshot.exists) {
+        setState(() {
+          connectionStatus = 'Room not found';
+        });
+        _resetToAIMode();
+        return;
+      }
+
+      final data = snapshot.value as Map<dynamic, dynamic>;
+      final players = data['players'] as Map<dynamic, dynamic>? ?? {};
+
+      if (players.length >= 2) {
+        setState(() {
+          connectionStatus = 'Room is full';
+        });
+        _resetToAIMode();
+        return;
+      }
+
+      // Add the new player
+      await roomRef.child('players').child(playerId!).set(true);
+
+      // Get host's player ID for opponent tracking
+      final hostId = data['host'] as String?;
+      if (hostId != null && hostId != playerId) {
+        opponentId = hostId;
+      }
+
+      setState(() {
+        waitingForOpponent = true;
+        connectionStatus = 'Joined room: $roomCode';
+        showJoinRoom = false;
+        showRoomSelection = false;
+      });
+
+      _listenToRoom();
+    } catch (e) {
+      setState(() {
+        connectionStatus = 'Error joining room: $e';
+      });
+      _resetToAIMode();
+    }
+  }
+
+// Add this helper method to safely return to AI mode on errors
+  void _resetToAIMode() {
+    setState(() {
+      gameMode = 'ai';
+      showRoomSelection = false;
+      showCreateRoom = false;
+      showJoinRoom = false;
+      connectionStatus = '';
+    });
+
+    // Set up a fresh AI game
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (mounted && gameMode == 'ai') {
+        _setupGame();
+      }
+    });
+  }
+
+  void _listenToRoom() {
+    if (roomCode == null) return;
+
+    final DatabaseReference roomRef =
+        FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+    gameSubscription = roomRef.onValue.listen((DatabaseEvent event) {
+      if (!mounted) return;
+
+      try {
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data == null) {
+          _handleOpponentDisconnect();
+          return;
+        }
+
+        final gameState = data['gameState'] as String?;
+        final players = data['players'] as Map<dynamic, dynamic>? ?? {};
+
+        // Check for opponent disconnect
+        if (players.length < 2 && !waitingForOpponent) {
+          _handleOpponentDisconnect();
+          return;
+        }
+
+        // Set opponent ID if we don't have it
+        if (opponentId == null && players.length == 2) {
+          for (String pid in players.keys.cast<String>()) {
+            if (pid != playerId) {
+              opponentId = pid;
+              break;
+            }
+          }
+        }
+
+        // FIXED: If we're the host and a second player joined, start the game
+        if (isHost && players.length == 2 && gameState == 'waiting') {
+          _initializeCompleteGameState();
+        }
+
+        if (gameState == 'playing' && players.length == 2) {
+          if (waitingForOpponent) {
+            setState(() {
+              waitingForOpponent = false;
+              isSearchingForGame = false;
+              showInitialOverlay = false;
+              showCreateRoom = false;
+            });
+          }
+          _updateGameFromFirebase(data);
+        } else if (gameState == 'gameOver') {
+          _handleGameOverFromFirebase(data);
+        }
+      } catch (e) {
+        print('Error in _listenToRoom: $e');
+        if (mounted) {
+          setState(() {
+            connectionStatus = 'Connection error occurred';
+          });
+        }
+      }
+    });
+  }
+
+  Future<void> _initializeCompleteGameState([String? firstPlayer]) async {
+    if (!isHost || roomCode == null || opponentId == null) return;
+
+    try {
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      // Create and distribute decks
+      fullDeck = _createFullDeck();
+      fullDeck.shuffle(Random());
+
+      final playerDeck = List<String>.from(fullDeck.sublist(0, 34));
+      final opponentDeck = List<String>.from(fullDeck.sublist(34, 68));
+
+      // Use provided firstPlayer or default to host
+      final gameFirstPlayer = firstPlayer ?? playerId!;
+
+      // CRITICAL FIX: Generate modifier assignments once and store in Firebase
+      List<String> shuffledModifiers = List.from(allModifiers)..shuffle();
+
+      // Assign modifiers to specific player IDs (not local variables)
+      List<String> hostModifiers = shuffledModifiers.take(3).toList();
+      List<String> guestModifiers = shuffledModifiers.skip(3).take(3).toList();
+
+      // Determine which player gets which modifiers based on their IDs
+      Map<String, List<String>> playerModifierAssignments = {
+        playerId!: hostModifiers, // Host gets first 3
+        opponentId!: guestModifiers, // Guest gets next 3
+      };
+
+      // Update local modifier assignments
+      playerAvailableModifiers = playerModifierAssignments[playerId!]!;
+      opponentAvailableModifiers = playerModifierAssignments[opponentId!]!;
+
+      // Reset modifier usage states based on assignments
+      playerModifiers = {};
+      opponentModifiers = {};
+
+      for (String modifier in playerAvailableModifiers) {
+        playerModifiers[modifier] = false;
+      }
+
+      for (String modifier in opponentAvailableModifiers) {
+        opponentModifiers[modifier] = false;
+      }
+
+      // Create sanitized versions for Firebase
+      Map<String, bool> myModifiersSanitized = {};
+      Map<String, bool> oppModifiersSanitized = {};
+
+      for (String key in playerModifiers.keys) {
+        String sanitizedKey = _sanitizeModifierForFirebase(key);
+        myModifiersSanitized[sanitizedKey] = playerModifiers[key] ?? false;
+      }
+
+      for (String key in opponentModifiers.keys) {
+        String sanitizedKey = _sanitizeModifierForFirebase(key);
+        oppModifiersSanitized[sanitizedKey] = opponentModifiers[key] ?? false;
+      }
+
+      // Store modifier assignments in Firebase so both players can see them
+      Map<String, List<String>> sanitizedAssignments = {};
+      for (String playerId in playerModifierAssignments.keys) {
+        sanitizedAssignments[playerId] = playerModifierAssignments[playerId]!
+            .map((modifier) => _sanitizeModifierForFirebase(modifier))
+            .toList();
+      }
+
+      // Initialize complete game state with modifier assignments
+      final updates = {
+        'gameState': 'playing',
+        'turn': gameFirstPlayer,
+        'field': [],
+        'activityLog': [],
+        'fieldAceValue': null,
+        'firstPlayer': gameFirstPlayer,
+        'gameData': {
+          'playerDecks': {
+            playerId!: playerDeck,
+            opponentId!: opponentDeck,
+          }
+        },
+        // CRITICAL: Store modifier assignments so both players can see them
+        'modifierAssignments': sanitizedAssignments,
+        'playerHands/$playerId': playerDeck.sublist(3, 5),
+        'playerHands/$opponentId': opponentDeck.sublist(3, 5),
+        'playerPrizeCards/$playerId': playerDeck.sublist(0, 3),
+        'playerPrizeCards/$opponentId': opponentDeck.sublist(0, 3),
+        'playerDrawPiles/$playerId': playerDeck.sublist(5),
+        'playerDrawPiles/$opponentId': opponentDeck.sublist(5),
+        'handSizes/$playerId': 2,
+        'handSizes/$opponentId': 2,
+        'maxHandSizes/$playerId': 2,
+        'maxHandSizes/$opponentId': 2,
+        'prizeCardCounts/$playerId': 3,
+        'prizeCardCounts/$opponentId': 3,
+        'drawPileSizes/$playerId': playerDeck.sublist(5).length,
+        'drawPileSizes/$opponentId': opponentDeck.sublist(5).length,
+        'playerModifiers/$playerId': myModifiersSanitized,
+        'playerModifiers/$opponentId': oppModifiersSanitized,
+        'lastTimeoutPenalty': null,
+        'rematchRequests': {},
+      };
+
+      await roomRef.update(updates);
+      print('DEBUG: Complete game state with modifier assignments initialized');
+    } catch (e) {
+      print('Error initializing complete game state: $e');
+    }
+  }
+
+  void _updateGameFromFirebase(Map<dynamic, dynamic> data) {
+    try {
+      final turn = data['turn'] as String?;
+      final gameState = data['gameState'] as String?;
+      final fieldData = data['field'] as List<dynamic>? ?? [];
+      final activityLogData = data['activityLog'] as List<dynamic>? ?? [];
+      final fieldAceValueData = data['fieldAceValue'] as int?;
+      final players = data['players'] as Map<dynamic, dynamic>? ?? {};
+
+      // CRITICAL FIX: Read modifier assignments from Firebase
+      final modifierAssignments =
+          data['modifierAssignments'] as Map<dynamic, dynamic>? ?? {};
+
+      if (modifierAssignments.isNotEmpty && opponentId != null) {
+        // Update my available modifiers
+        if (modifierAssignments.containsKey(playerId)) {
+          final myAssignedModifiers = List<String>.from(
+              (modifierAssignments[playerId] as List<dynamic>? ?? [])
+                  .cast<String>());
+
+          // Convert back from sanitized keys
+          playerAvailableModifiers = myAssignedModifiers
+              .map((sanitized) => _unsanitizeModifierFromFirebase(sanitized))
+              .toList();
+
+          print(
+              'DEBUG: Updated my available modifiers: $playerAvailableModifiers');
+        }
+
+        // Update opponent's available modifiers
+        if (modifierAssignments.containsKey(opponentId)) {
+          final oppAssignedModifiers = List<String>.from(
+              (modifierAssignments[opponentId] as List<dynamic>? ?? [])
+                  .cast<String>());
+
+          // Convert back from sanitized keys
+          opponentAvailableModifiers = oppAssignedModifiers
+              .map((sanitized) => _unsanitizeModifierFromFirebase(sanitized))
+              .toList();
+
+          print(
+              'DEBUG: Updated opponent available modifiers: $opponentAvailableModifiers');
+        }
+      }
+
+      final playerModifiersData =
+          data['playerModifiers'] as Map<dynamic, dynamic>? ?? {};
+
+      if (playerModifiersData.containsKey(playerId)) {
+        final myModifiers =
+            playerModifiersData[playerId] as Map<dynamic, dynamic>? ?? {};
+
+        // Clear current modifiers
+        for (String key in playerModifiers.keys) {
+          playerModifiers[key] = false;
+        }
+
+        // Only update modifiers that are in our assignment
+        for (String modifier in playerAvailableModifiers) {
+          String sanitizedKey = _sanitizeModifierForFirebase(modifier);
+          if (myModifiers.containsKey(sanitizedKey)) {
+            playerModifiers[modifier] =
+                myModifiers[sanitizedKey] as bool? ?? false;
+          }
+        }
+      }
+
+      if (opponentId != null && playerModifiersData.containsKey(opponentId)) {
+        final oppModifiers =
+            playerModifiersData[opponentId] as Map<dynamic, dynamic>? ?? {};
+
+        // Clear current opponent modifiers
+        for (String key in opponentModifiers.keys) {
+          opponentModifiers[key] = false;
+        }
+
+        // Only update modifiers that are in opponent's assignment
+        for (String modifier in opponentAvailableModifiers) {
+          String sanitizedKey = _sanitizeModifierForFirebase(modifier);
+          if (oppModifiers.containsKey(sanitizedKey)) {
+            opponentModifiers[modifier] =
+                oppModifiers[sanitizedKey] as bool? ?? false;
+          }
+        }
+      }
+
+      // Handle rematch transitions and early returns
+      if (gameState == 'playing' && players.length == 2) {
+        // Check if this is a rematch transition
+        if (_waitingForRematch && gameOver) {
+          final firstPlayer = data['firstPlayer'] as String?;
+          if (firstPlayer != null) {
+            _handleRematchStart(firstPlayer);
+          }
+        }
+
+        if (waitingForOpponent) {
+          setState(() {
+            waitingForOpponent = false;
+            isSearchingForGame = false;
+            showInitialOverlay = false;
+            showCreateRoom = false;
+          });
+        }
+        // Continue with normal game state processing below
+      } else if (gameState == 'gameOver') {
+        _handleGameOverFromFirebase(data);
+        return; // Exit early for game over state
+      }
+
+      // ENHANCED DEBUG LOGGING
+      print('=== FIREBASE UPDATE DEBUG ===');
+      print('My playerId: $playerId');
+      print('My opponentId: $opponentId');
+      print('Firebase turn: $turn');
+      print('Firebase gameState: $gameState');
+      print('My current isPlayerTurn: $isPlayerTurn');
+      print('Am I host: $isHost');
+      print('Current message: $message');
+      print('Game over: $gameOver');
+      print('Field length: ${fieldData.length}');
+      print('Activity log length: ${activityLogData.length}');
+      print('==============================');
+
+      // Get game data
+      final gameData = data['gameData'] as Map<dynamic, dynamic>? ?? {};
+      final playerDecks =
+          gameData['playerDecks'] as Map<dynamic, dynamic>? ?? {};
+      final playerHandsData =
+          data['playerHands'] as Map<dynamic, dynamic>? ?? {};
+      final playerPrizeCardsData =
+          data['playerPrizeCards'] as Map<dynamic, dynamic>? ?? {};
+      final playerDrawPilesData =
+          data['playerDrawPiles'] as Map<dynamic, dynamic>? ?? {};
+      final handSizes = data['handSizes'] as Map<dynamic, dynamic>? ?? {};
+      final prizeCardCounts =
+          data['prizeCardCounts'] as Map<dynamic, dynamic>? ?? {};
+      final drawPileSizes =
+          data['drawPileSizes'] as Map<dynamic, dynamic>? ?? {};
+      final maxHandSizes = data['maxHandSizes'] as Map<dynamic, dynamic>? ?? {};
+
+      setState(() {
+        // FIXED: Store previous turn state to detect changes and add debug logging
+        final wasMyTurn = isPlayerTurn;
+        final newTurnState = (turn == playerId);
+
+        print('TURN DEBUG: wasMyTurn=$wasMyTurn, newTurnState=$newTurnState');
+
+        // CRITICAL: Add validation that we have proper opponent ID
+        if (opponentId == null) {
+          print('WARNING: opponentId is null! Attempting to find opponent...');
+          // Try to find opponent from players in the room data
+          if (players.length == 2) {
+            for (String pid in players.keys.cast<String>()) {
+              if (pid != playerId) {
+                opponentId = pid;
+                print('DEBUG: Found opponentId: $opponentId');
+                break;
+              }
+            }
+          }
+        }
+
+        // CRITICAL FIX: Only trust Firebase for turn state
+        isPlayerTurn = newTurnState;
+
+        // Track previous field length to detect opponent card plays
+        final previousFieldLength = field.length;
+        field = List<String>.from(fieldData.cast<String>());
+
+// Play card sound when opponent plays (field grows and it wasn't my turn)
+        if (!wasMyTurn && !isPlayerTurn && field.length > previousFieldLength) {
+          Future.delayed(const Duration(milliseconds: 100), () {
+            playCardSound();
+          });
+        }
+
+        // FIXED: Process activity log with proper "you" vs "opponent" labeling
+        final rawActivityLog =
+            List<String>.from(activityLogData.cast<String>());
+        activityLog = rawActivityLog.map((message) {
+          String processedMessage = message;
+
+          if (message.startsWith('$playerId played:')) {
+            processedMessage =
+                message.replaceFirst('$playerId played:', 'You played:');
+          } else if (opponentId != null &&
+              message.startsWith('$opponentId played:')) {
+            processedMessage =
+                message.replaceFirst('$opponentId played:', 'Opp played:');
+          } else if (message.contains('timed out')) {
+            // Handle timeout messages
+            if (message.startsWith('$playerId timed out')) {
+              processedMessage = message.replaceFirst(
+                  '$playerId timed out - $opponentId gets prize card!',
+                  'You timed out!');
+            } else if (opponentId != null &&
+                message.startsWith('$opponentId timed out')) {
+              processedMessage = message.replaceFirst(
+                  '$opponentId timed out - $playerId gets prize card!',
+                  'Opponent timed out!');
+            }
+          } else if (message.contains('used') &&
+              (message.contains('modifier') || message.contains('mod'))) {
+            // Handle modifier usage messages
+            if (message.startsWith('$playerId used')) {
+              processedMessage =
+                  message.replaceFirst('$playerId used', 'You used');
+            } else if (opponentId != null &&
+                message.startsWith('$opponentId used')) {
+              processedMessage =
+                  message.replaceFirst('$opponentId used', 'Opp used');
+            }
+          }
+
+          // Remove the result indicators from the visible message
+          processedMessage =
+              processedMessage.replaceAll(RegExp(r' \((winning|normal)\)'), '');
+
+          return processedMessage;
+        }).toList();
+
+// NEW: Set activity log color based on the latest message (before cleaning)
+        if (activityLogData.isNotEmpty) {
+          final lastRawMessage = activityLogData.last as String;
+          if (lastRawMessage.startsWith('$playerId played:')) {
+            // Check if this was a winning play
+            if (lastRawMessage.contains('(winning)')) {
+              activityLogColor = Colors.greenAccent; // Player won a prize
+            } else {
+              activityLogColor = Colors.white; // Regular play
+            }
+          } else if (opponentId != null &&
+              lastRawMessage.startsWith('$opponentId played:')) {
+            // Check if opponent won a prize
+            if (lastRawMessage.contains('(winning)')) {
+              activityLogColor = Colors.redAccent; // Opponent won a prize
+            } else {
+              activityLogColor = Colors.white; // Regular play
+            }
+          } else if (lastRawMessage.contains('timed out')) {
+            activityLogColor = Colors.white; // Timeout message
+          } else {
+            activityLogColor = Colors.white; // Default
+          }
+        }
+
+        fieldAceValue = fieldAceValueData;
+
+        // Initialize local game if we have deck data
+        if (playerDecks.containsKey(playerId)) {
+          final myDeck = List<String>.from(
+              (playerDecks[playerId] as List<dynamic>)
+                  .cast<String>()); // FIXED: Create mutable copy
+          if (playerHand.isEmpty) {
+            // First time setup
+            print('DEBUG: Initializing my deck and hand');
+            playerDeck = myDeck;
+            playerHand = List<String>.from(myDeck.sublist(3, 5));
+            playerPrizeCards = List<String>.from(myDeck.sublist(0, 3));
+            playerDrawPile = List<String>.from(myDeck.sublist(5));
+          }
+        }
+
+        // Set up opponent data locally
+        if (opponentId != null && playerDecks.containsKey(opponentId)) {
+          final opponentDeckData = List<String>.from(
+              (playerDecks[opponentId] as List<dynamic>)
+                  .cast<String>()); // FIXED: Create mutable copy
+          if (opponentActualHand.isEmpty) {
+            // First time setup
+            print('DEBUG: Initializing opponent deck and hand');
+            opponentDeck = opponentDeckData;
+            opponentActualHand =
+                List<String>.from(opponentDeckData.sublist(3, 5));
+            opponentPrizeCards = List.generate(3, (_) => 'cardback');
+            opponentActualDrawPile =
+                List<String>.from(opponentDeckData.sublist(5));
+          }
+        }
+
+        // FIXED: Only update player data if it exists in Firebase
+        if (playerHandsData.containsKey(playerId)) {
+          final handData = List<String>.from(
+              (playerHandsData[playerId] as List<dynamic>)
+                  .cast<String>()); // FIXED: Create mutable copy
+          // FIXED: Only update if the data is different to prevent unnecessary overwrites
+          if (handData.length != playerHand.length ||
+              !_listsEqual(handData, playerHand)) {
+            print('DEBUG: Updating playerHand from Firebase: $handData');
+            playerHand = handData;
+          }
+        }
+
+        if (playerPrizeCardsData.containsKey(playerId)) {
+          final prizeData = List<String>.from(
+              (playerPrizeCardsData[playerId] as List<dynamic>).cast<String>());
+          if (prizeData.length != playerPrizeCards.length ||
+              !_listsEqual(prizeData, playerPrizeCards)) {
+            print(
+                'DEBUG: Updating playerPrizeCards from Firebase: ${prizeData.length} cards');
+            playerPrizeCards = prizeData;
+          }
+        } else if (prizeCardCounts.containsKey(playerId)) {
+          // FIXED: Only sync counts if we don't have explicit prize card data
+          // and ONLY if the count is LARGER than current (never regenerate lost cards)
+          final expectedPrizeCount = prizeCardCounts[playerId] as int;
+          if (expectedPrizeCount > playerPrizeCards.length) {
+            print(
+                'DEBUG: Adding missing prize cards: ${expectedPrizeCount - playerPrizeCards.length}');
+            while (playerPrizeCards.length < expectedPrizeCount) {
+              playerPrizeCards.add('cardback');
+            }
+          }
+          // DO NOT regenerate if count is smaller - that means cards were legitimately lost
+        }
+
+        if (playerDrawPilesData.containsKey(playerId)) {
+          final drawData = List<String>.from(
+              (playerDrawPilesData[playerId] as List<dynamic>)
+                  .cast<String>()); // FIXED: Create mutable copy
+          if (drawData.length != playerDrawPile.length ||
+              !_listsEqual(drawData, playerDrawPile)) {
+            print(
+                'DEBUG: Updating playerDrawPile from Firebase: ${drawData.length} cards');
+            playerDrawPile = drawData;
+          }
+        }
+
+        if (maxHandSizes.containsKey(playerId)) {
+          final maxHandSizeData = maxHandSizes[playerId] as int? ?? 2;
+          if (maxHandSizeData != playerMaxHandSize) {
+            print(
+                'DEBUG: Updating playerMaxHandSize from Firebase: $maxHandSizeData');
+            playerMaxHandSize = maxHandSizeData;
+          }
+        }
+
+        // FIXED: Sync modifier states from Firebase
+        final playerModifiersData =
+            data['playerModifiers'] as Map<dynamic, dynamic>? ?? {};
+
+        if (playerModifiersData.containsKey(playerId)) {
+          final myModifiers =
+              playerModifiersData[playerId] as Map<dynamic, dynamic>? ?? {};
+          for (String key in playerModifiers.keys) {
+            if (myModifiers.containsKey(key)) {
+              playerModifiers[key] = myModifiers[key] as bool? ?? false;
+            }
+          }
+        }
+
+        if (opponentId != null && playerModifiersData.containsKey(opponentId)) {
+          final oppModifiers =
+              playerModifiersData[opponentId] as Map<dynamic, dynamic>? ?? {};
+          for (String key in opponentModifiers.keys) {
+            if (oppModifiers.containsKey(key)) {
+              opponentModifiers[key] = oppModifiers[key] as bool? ?? false;
+            }
+          }
+        }
+
+        // Check for timeout penalty first to determine if opponent prize decrease is due to penalty
+        final lastTimeoutPenalty =
+            data['lastTimeoutPenalty'] as Map<dynamic, dynamic>?;
+        final isOpponentTimeoutPenalty = lastTimeoutPenalty != null &&
+            lastTimeoutPenalty['penalizedPlayer'] == opponentId;
+
+        // Update OPPONENT display based on sizes
+        if (opponentId != null) {
+          final opponentHandSize =
+              handSizes[opponentId] as int? ?? opponentHand.length;
+          final opponentPrizeCount =
+              prizeCardCounts[opponentId] as int? ?? opponentPrizeCards.length;
+          final opponentDrawSize =
+              drawPileSizes[opponentId] as int? ?? opponentDrawPile.length;
+          final opponentMaxHandSize = maxHandSizes[opponentId] as int? ?? 2;
+
+          print(
+              'DEBUG: Opponent sizes - Hand: $opponentHandSize, Prizes: $opponentPrizeCount, Draw: $opponentDrawSize');
+
+          // Check if opponent won a prize card (their count decreased) before updating
+          final previousOpponentPrizeCount = opponentPrizeCards.length;
+          final opponentCountDecreased =
+              opponentPrizeCount < previousOpponentPrizeCount;
+
+          // Only treat as "opponent won prize" if count decreased AND it's NOT a timeout penalty
+          final opponentWonPrize =
+              opponentCountDecreased && !isOpponentTimeoutPenalty;
+
+          // FIXED: Only update if sizes changed to prevent unnecessary rebuilds
+          if (opponentHand.length != opponentHandSize) {
+            print(
+                'DEBUG: Updating opponent hand size from ${opponentHand.length} to $opponentHandSize');
+            opponentHand = List.generate(opponentHandSize, (_) => 'cardback');
+          }
+          if (opponentPrizeCards.length != opponentPrizeCount) {
+            print(
+                'DEBUG: Updating opponent prize count from ${opponentPrizeCards.length} to $opponentPrizeCount');
+
+            // Only play prize sound if opponent legitimately won a prize (not penalty)
+            if (opponentWonPrize) {
+              Future.delayed(const Duration(milliseconds: 100), () {
+                playPrizeCardSound();
+              });
+            }
+
+            opponentPrizeCards =
+                List.generate(opponentPrizeCount, (_) => 'cardback');
+          }
+          if (opponentDrawPile.length != opponentDrawSize) {
+            print(
+                'DEBUG: Updating opponent draw pile from ${opponentDrawPile.length} to $opponentDrawSize');
+            opponentDrawPile =
+                List.generate(opponentDrawSize, (_) => 'cardback');
+          }
+        }
+
+        // FIXED: Critical turn management - only act on actual turn changes
+        if (!gameOver) {
+          if (isPlayerTurn && !wasMyTurn) {
+            // Turn switched TO me
+            print('🟢 TURN STARTED FOR ME');
+            message = "Your turn!";
+            turnTimer?.cancel();
+            startTimer();
+            clearSelections();
+          } else if (!isPlayerTurn && wasMyTurn) {
+            // Turn switched AWAY from me
+            print('🔴 TURN ENDED FOR ME');
+            message = "Opponent's turn!";
+            turnTimer?.cancel();
+            clearSelections();
+            activePlayerModifier = null; // Clears any selected modifiers
+            showModifierSelection = false;
+
+            // NEW: Close ace dialog if it's open
+            if (_aceDialogOpen && mounted) {
+              Navigator.of(context).pop(); // Close the dialog
+              _aceDialogOpen = false;
+            }
+          } else if (isPlayerTurn &&
+              (turnTimer == null || !turnTimer!.isActive)) {
+            // I still have turn but timer isn't running
+            print('⚠️ RESTARTING TIMER FOR MY TURN');
+            message = "Your turn!";
+            startTimer();
+            clearSelections();
+          } else if (!isPlayerTurn) {
+            print('⏸️ WAITING FOR OPPONENT');
+            message = "Opponent's turn!";
+          } else {
+            print('ℹ️ NO TURN CHANGE NEEDED');
+          }
+        }
+
+        // Check for win conditions
+        if (!gameOver) {
+          checkForWin();
+        }
+      });
+
+      // Add debug logging for modifier state
+      print('=== MODIFIER DEBUG ===');
+      print('My available modifiers: $playerAvailableModifiers');
+      print('My modifier usage: $playerModifiers');
+      print('Opponent available modifiers: $opponentAvailableModifiers');
+      print('Opponent modifier usage: $opponentModifiers');
+      print('======================');
+    } catch (e) {
+      print('❌ ERROR in _updateGameFromFirebase: $e');
+      print('Stack trace: ${StackTrace.current}');
+    }
+  }
+
+// Helper method to compare lists efficiently
+  bool _listsEqual<T>(List<T> list1, List<T> list2) {
+    if (list1.length != list2.length) return false;
+    for (int i = 0; i < list1.length; i++) {
+      if (list1[i] != list2[i]) return false;
+    }
+    return true;
+  }
+
+  void _handleGameOverFromFirebase(Map<dynamic, dynamic> data) {
+    final winner = data['winner'] as String?;
+    final winnerMessage = data['winnerMessage'] as String?;
+
+    // First, ensure game over state is set for both players
+    if (!gameOver) {
+      setState(() {
+        gameOver = true;
+        this.winner = winner == playerId ? 'player' : 'opponent';
+        message = winnerMessage ??
+            (winner == playerId ? "You win!" : "Opponent wins!");
+        isPlayerTurn = false;
+        clearSelections();
+      });
+      turnTimer?.cancel();
+
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (winner == playerId) {
+          playGameWinSound();
+        } else {
+          playGameLossSound();
+        }
+      });
+    }
+
+    // Handle rematch requests - but don't change gameOver state until both players are ready
+    final rematchRequests =
+        data['rematchRequests'] as Map<dynamic, dynamic>? ?? {};
+
+    // If this player hasn't requested rematch yet, don't process other player's request
+    if (!rematchRequests.containsKey(playerId)) {
+      return;
+    }
+
+    // Only proceed if both players have requested rematch
+    if (rematchRequests.length == 2 && gameOver) {
+      // Get who went first last game and alternate
+      final lastFirstPlayer = data['firstPlayer'] as String?;
+      final nextFirstPlayer =
+          (lastFirstPlayer == playerId) ? opponentId : playerId;
+
+      if (isHost) {
+        // Host initializes the new game
+        print('Host starting rematch for both players');
+        _resetGameState();
+        _initializeCompleteGameState(nextFirstPlayer).then((_) {
+          if (mounted) {
+            setState(() {
+              gameOver = false;
+              waitingForOpponent = false;
+              _waitingForRematch = false;
+              message = (nextFirstPlayer == playerId)
+                  ? "Your turn!"
+                  : "Opponent's turn!";
+              isPlayerTurn = (nextFirstPlayer == playerId);
+            });
+            if (nextFirstPlayer == playerId) {
+              startTimer();
+            }
+          }
+        }).catchError((error) {
+          print('Error initializing rematch: $error');
+          // Reset waiting state on error
+          if (mounted) {
+            setState(() {
+              _waitingForRematch = false;
+              message = "Failed to start new game";
+            });
+          }
+        });
+      } else {
+        // Non-host waits for host to initialize, but doesn't change gameOver yet
+        print('Non-host waiting for host to initialize rematch');
+        setState(() {
+          _waitingForRematch = true;
+          message = "Starting new game...";
+        });
+
+        // The actual game state change will come through the normal Firebase listener
+        // when the host updates the game state to 'playing'
+      }
+    }
+  }
+
+// Also add this helper method to handle the transition from waiting to playing
+  void _handleRematchStart(String nextFirstPlayer) {
+    if (mounted && _waitingForRematch) {
+      setState(() {
+        gameOver = false;
+        waitingForOpponent = false;
+        _waitingForRematch = false;
+        message =
+            (nextFirstPlayer == playerId) ? "Your turn!" : "Opponent's turn!";
+        isPlayerTurn = (nextFirstPlayer == playerId);
+      });
+
+      if (nextFirstPlayer == playerId) {
+        startTimer();
+      }
+    }
+  }
+
+  Future<void> _updateFirebaseGameState() async {
+    if (roomCode == null || playerId == null || _isUpdatingFirebase) return;
+
+    try {
+      _isUpdatingFirebase = true;
+
+      // Generate activity message for this move
+      String activityMessage;
+      List<String> formattedCards = [];
+
+      for (int i = 0; i < playedCards.length; i++) {
+        String card = playedCards[i];
+        String cardNum;
+
+        if (card == 'a') {
+          cardNum = fieldAceValue?.toString() ?? '14';
+        } else {
+          cardNum = cardValue(card).toString().replaceAll('.0', '');
+        }
+
+        if (i == 0) {
+          formattedCards.add(cardNum);
+        } else if (selectedOps.isNotEmpty && (i - 1) < selectedOps.length) {
+          formattedCards.add('${selectedOps[i - 1]} $cardNum');
+        } else {
+          formattedCards.add('+ $cardNum');
+        }
+      }
+
+      activityMessage = "$playerId played: ${formattedCards.join(' ')}";
+
+      if (appliedModifier != null) {
+        activityMessage += ' ($appliedModifier)';
+      }
+
+      activityMessage +=
+          ' (${activityLogColor == Colors.greenAccent ? 'winning' : 'normal'})';
+
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      // ENHANCED: Better retry logic with validation
+      int maxRetries = 3;
+      int retryDelay = 500;
+
+      for (int attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          final result = await roomRef.runTransaction((Object? current) {
+            if (current == null) {
+              print('DEBUG: Transaction aborted - room no longer exists');
+              return Transaction.abort();
+            }
+
+            final data = current as Map<dynamic, dynamic>;
+            final currentTurn = data['turn'] as String?;
+            final currentGameState = data['gameState'] as String?;
+
+            // CRITICAL: Enhanced validation
+            if (currentTurn != playerId) {
+              print(
+                  'DEBUG: Turn validation failed - currentTurn: $currentTurn, playerId: $playerId');
+              return Transaction.abort();
+            }
+
+            if (currentGameState == 'gameOver') {
+              print('DEBUG: Game is already over, aborting transaction');
+              return Transaction.abort();
+            }
+
+            // Update all game state atomically
+            data['field'] = List.from(field);
+            data['activityLog'] = List.from(activityLog)..add(activityMessage);
+            data['fieldAceValue'] = fieldAceValue;
+
+            // Initialize nested maps if they don't exist
+            data['playerHands'] ??= {};
+            data['playerPrizeCards'] ??= {};
+            data['playerDrawPiles'] ??= {};
+            data['handSizes'] ??= {};
+            data['prizeCardCounts'] ??= {};
+            data['drawPileSizes'] ??= {};
+            data['maxHandSizes'] ??= {};
+            data['playerModifiers'] ??= {};
+
+            // Update player-specific data
+            (data['playerHands'] as Map)[playerId!] = List.from(playerHand);
+            (data['playerPrizeCards'] as Map)[playerId!] =
+                List.from(playerPrizeCards);
+            (data['playerDrawPiles'] as Map)[playerId!] =
+                List.from(playerDrawPile);
+            (data['handSizes'] as Map)[playerId!] = playerHand.length;
+            (data['maxHandSizes'] as Map)[playerId!] = playerMaxHandSize;
+            (data['prizeCardCounts'] as Map)[playerId!] =
+                playerPrizeCards.length;
+            (data['drawPileSizes'] as Map)[playerId!] = playerDrawPile.length;
+
+            // FIX: Sanitize modifier keys before saving to Firebase
+            Map<String, bool> sanitizedModifiers = {};
+            for (String key in playerModifiers.keys) {
+              String sanitizedKey = _sanitizeModifierForFirebase(key);
+              sanitizedModifiers[sanitizedKey] = playerModifiers[key] ?? false;
+            }
+            (data['playerModifiers'] as Map)[playerId!] = sanitizedModifiers;
+
+            // Switch turn to opponent ONLY if game is still playing
+            if (opponentId != null &&
+                !gameOver &&
+                currentGameState == 'playing') {
+              data['turn'] = opponentId;
+              print(
+                  'DEBUG: Successfully switching turn to opponent: $opponentId');
+            }
+
+            return Transaction.success(data);
+          });
+
+          if (result.committed) {
+            print(
+                'DEBUG: Firebase transaction committed successfully on attempt ${attempt + 1}');
+
+            // CRITICAL: Only update local state AFTER successful Firebase commit
+            if (mounted) {
+              setState(() {
+                message = "Move sent - waiting for opponent...";
+                isPlayerTurn = false; // This should now be reliable
+              });
+            }
+            return; // Success, exit retry loop
+          } else {
+            print(
+                'DEBUG: Firebase transaction failed to commit on attempt ${attempt + 1}');
+
+            if (attempt == maxRetries - 1) {
+              throw Exception(
+                  'Transaction failed to commit after $maxRetries attempts');
+            }
+
+            await Future.delayed(Duration(milliseconds: retryDelay));
+            retryDelay *= 2;
+          }
+        } catch (e) {
+          print('Error in transaction attempt ${attempt + 1}: $e');
+
+          if (attempt == maxRetries - 1) {
+            rethrow;
+          }
+
+          await Future.delayed(Duration(milliseconds: retryDelay));
+          retryDelay *= 2;
+        }
+      }
+    } catch (e) {
+      print('Final error updating Firebase game state: $e');
+
+      // IMPROVED: Better error recovery
+      if (mounted) {
+        setState(() {
+          message = "Connection issue - retrying...";
+          // DON'T immediately restart turn - wait for recovery
+        });
+
+        // Attempt to recover by refreshing game state
+        Future.delayed(Duration(seconds: 2), () {
+          if (mounted && gameMode == 'human' && !gameOver) {
+            _refreshGameStateFromFirebase();
+          }
+        });
+      }
+    } finally {
+      _isUpdatingFirebase = false;
+      appliedModifier = null;
+    }
+  }
+
+// Add this helper method for recovery
+  Future<void> _refreshGameStateFromFirebase() async {
+    if (roomCode == null) return;
+
+    try {
+      final roomRef = FirebaseDatabase.instance.ref('rooms/$roomCode');
+      final snapshot = await roomRef.get();
+
+      if (snapshot.exists && mounted) {
+        final data = snapshot.value as Map<dynamic, dynamic>;
+        _updateGameFromFirebase(data);
+      }
+    } catch (e) {
+      print('Error refreshing game state: $e');
+      // If refresh fails, allow player to try again
+      if (mounted) {
+        setState(() {
+          message = "Connection restored - your turn!";
+          isPlayerTurn = true;
+        });
+        startTimer();
+      }
+    }
+  }
+
+  Future<void> _startRematch() async {
+    setState(() {
+      currentBackgroundIndex =
+          (currentBackgroundIndex + 1) % backgrounds.length;
+    });
+
+    if (roomCode == null || playerId == null || opponentId == null) return;
+
+    try {
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      // Mark this player as ready for rematch
+      await roomRef.child('rematchRequests').child(playerId!).set(true);
+
+      // Update UI to show waiting state
+      setState(() {
+        _waitingForRematch = true;
+        message = "Waiting for opponent to start next game...";
+      });
+
+      // Note: The actual game state transition will be handled by _handleGameOverFromFirebase
+      // when it detects both players have requested a rematch
+    } catch (e) {
+      print('Error starting rematch: $e');
+      setState(() {
+        _waitingForRematch = false;
+        message = "Failed to start rematch";
+      });
+    }
+  }
+
+  void _handleOpponentDisconnect() {
+    if (gameMode != 'human') return;
+
+    print('DEBUG: Handling opponent disconnect');
+
+    setState(() {
+      message = "Opponent disconnected";
+      isPlayerTurn = false;
+      turnTimer?.cancel();
+    });
+
+    // Optional: Auto-switch to AI mode or return to menu
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted && gameMode == 'human') {
+        setState(() {
+          showRoomSelection = true;
+          connectionStatus = 'Opponent disconnected';
+        });
+      }
+    });
+  }
+
+  void _setupMultiplayerGame() {
+    // This method is now largely handled by Firebase initialization
+    // Just reset local state
+    try {
+      print('DEBUG: Setting up multiplayer game - isHost: $isHost');
+
+      _resetGameState();
+
+      // CRITICAL: Don't set turn state here - let Firebase handle it
+      // The turn state should come from Firebase listener
+      message = "Waiting for game to start...";
+
+      setState(() {});
+
+      print('DEBUG: Multiplayer game setup complete');
+    } catch (e) {
+      print('Error setting up multiplayer game: $e');
+      setState(() {
+        connectionStatus = 'Failed to setup game: $e';
+        showRoomSelection = true;
+      });
+    }
+  }
+
+  // Update your room selection cancel logic
+  void _cancelRoomSelection() {
+    setState(() {
+      showRoomSelection = false;
+      connectionStatus = '';
+    });
+
+    // Resume AI game if we were in AI mode
+    if (gameMode == 'ai' && !gameOver) {
+      setState(() {
+        message = isPlayerTurn ? "Your turn!" : "Opponent's turn!";
+      });
+
+      if (isPlayerTurn) {
+        startTimer();
+      }
+    }
+  }
+
+// Update your _leaveRoom method to handle cleanup better
+  void _leaveRoom() {
+    try {
+      // Cancel timers and listeners
+      turnTimer?.cancel();
+      gameSubscription?.cancel();
+
+      // Remove from Firebase room
+      if (roomCode != null && playerId != null) {
+        final DatabaseReference roomRef =
+            FirebaseDatabase.instance.ref('rooms/$roomCode');
+        roomRef.child('players').child(playerId!).remove();
+      }
+    } catch (e) {
+      print('Error leaving room: $e');
+    } finally {
+      _resetMultiplayerState();
+      _resetToAIMode();
+    }
+  }
+
+  // Update your _showGameModeSelection method
+  void _showGameModeSelection() {
+    // Pause the current game safely
+    turnTimer?.cancel();
+
+    setState(() {
+      showRoomSelection = true;
+      message = 'Game paused';
+    });
+  }
+
+// Helper Methods
+  List<String> _createFullDeck() {
+    List<String> deck = [];
+    for (var value in [
+      '2',
+      '3',
+      '4',
+      '5',
+      '6',
+      '7',
+      '8',
+      '9',
+      '10',
+      'j',
+      'q',
+      'k',
+      'a'
+    ]) {
+      for (int i = 0; i < 5; i++) {
+        // Changed from 4 to 5
+        deck.add(value);
+      }
+    }
+    deck.add('jkr');
+    deck.add('jkr');
+    deck.add('jkr'); // Added third joker
+    return deck;
+  }
+
+  void _assignRandomModifiers() {
+    List<String> shuffledModifiers = List.from(allModifiers)..shuffle();
+
+    playerAvailableModifiers = shuffledModifiers.take(3).toList();
+    opponentAvailableModifiers = shuffledModifiers.skip(3).take(3).toList();
+
+    // Reset modifier usage maps to only include assigned modifiers
+    playerModifiers = {};
+    opponentModifiers = {};
+
+    for (String modifier in playerAvailableModifiers) {
+      playerModifiers[modifier] = false;
+    }
+
+    for (String modifier in opponentAvailableModifiers) {
+      opponentModifiers[modifier] = false;
+    }
+  }
+
+  void _resetGameState() {
+    field = [];
+    activityLog.clear();
+    fieldAceValue = null;
+    fieldAceValueHistory.clear();
+    gameOver = false;
+    clearSelections();
+    playerMaxHandSize = 2;
+    activePlayerModifier = null;
+    showModifierSelection = false;
+
+    // Reset modifiers for new game
+    playerModifiers = {
+      'mulligan': false,
+      '2x': false,
+      '+3': false,
+      '-3': false,
+      '-1': false,
+      '+1': false,
+      '+11': false,
+      'draw1': false,
+      '-0.5': false,
+      'rewind': false,
+    };
+
+    opponentModifiers = {
+      'mulligan': false,
+      '2x': false,
+      '+3': false,
+      '-3': false,
+      '-1': false,
+      '+1': false,
+      '+11': false,
+      'draw1': false,
+      '-0.5': false,
+      'rewind': false,
+    };
+
+    // Assign random modifiers for new game
+    _assignRandomModifiers();
+  }
+
+  void _resetMultiplayerState() {
+    quickMatchSubscription?.cancel();
+    quickMatchSubscription = null;
+    
+    setState(() {
+      roomCode = null;
+      playerId = null;
+      opponentId = null;
+      isHost = false;
+      waitingForOpponent = false;
+      isSearchingForGame = false;
+      connectionStatus = '';
+      gameMode = 'ai';
+      showRoomSelection = false;
+      showInitialOverlay = true;
+// Reset hand data
+      opponentActualHand = [];
+      opponentActualDrawPile = [];
+      lastKnownOpponentHandSize = null;
+      lastKnownOpponentDrawPileSize = null;
+    });
+  }
+
+// Defensive Helper Methods
+  void safeRemoveFromHand(
+      List<String> hand, List<int> indices, String handName) {
+// Validate all indices before removing any
+    for (int i = 0; i < indices.length; i++) {
+      if (indices[i] < 0 || indices[i] >= hand.length) {
+        print(
+            'ERROR: Index ${indices[i]} out of bounds for $handName (length: ${hand.length})');
+        return;
+      }
+    }
+
+// Sort indices in descending order to avoid index shifting issues
+    List<int> sortedIndices = List.from(indices)
+      ..sort((a, b) => b.compareTo(a));
+
+// Remove cards from hand
+    for (int index in sortedIndices) {
+      if (index >= 0 && index < hand.length) {
+        hand.removeAt(index);
+      } else {
+        print('CRITICAL: Index became invalid during removal: $index');
+        break;
+      }
+    }
+  }
+
   T? safeListAccess<T>(List<T> list, int index, [String? listName]) {
     if (index < 0 || index >= list.length) {
       if (listName != null) {
         print(
-          'WARNING: Index $index out of bounds for $listName (length: ${list.length})',
-        );
+            'WARNING: Index $index out of bounds for $listName (length: ${list.length})');
       }
       return null;
     }
     return list[index];
   }
 
-  /// Validates that selectedIndices and selectedOps are in sync
   bool validateSelections() {
-    // Check bounds
     for (int i = 0; i < selectedIndices.length; i++) {
       if (selectedIndices[i] < 0 || selectedIndices[i] >= playerHand.length) {
         print(
-          'Invalid selectedIndices[$i]: ${selectedIndices[i]} (hand length: ${playerHand.length})',
-        );
+            'Invalid selectedIndices[$i]: ${selectedIndices[i]} (hand length: ${playerHand.length})');
         return false;
       }
     }
 
-    // Check operation count
-    int expectedOpsCount = selectedIndices.length > 1
-        ? selectedIndices.length - 1
-        : 0;
+    int expectedOpsCount =
+        selectedIndices.length > 1 ? selectedIndices.length - 1 : 0;
     if (selectedOps.length != expectedOpsCount) {
       print(
-        'selectedOps length mismatch: ${selectedOps.length} vs expected $expectedOpsCount',
-      );
+          'selectedOps length mismatch: ${selectedOps.length} vs expected $expectedOpsCount');
       return false;
     }
 
     return true;
   }
 
-  /// Safe card drawing that handles empty piles
   void safeDrawCards(List<String> hand, List<String> drawPile, int targetSize) {
     while (hand.length < targetSize && drawPile.isNotEmpty) {
       try {
@@ -145,15 +1875,46 @@ class _GameScreenState extends State<GameScreen> {
   @override
   void initState() {
     super.initState();
-    // Make fullscreen
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    // Initialize opponent data structures
+    opponentActualHand = [];
+    opponentActualDrawPile = [];
+    opponentHand = [];
+    opponentDrawPile = [];
+    opponentPrizeCards = [];
+    processedTimeoutPenalties = <String>{};
+    _preloadTapSound();
+    _configureLowLatencyAudio();
+    _loadHighScore(); 
     _setupGame();
+  }
+
+  Future<void> _preloadTapSound() async {
+    try {
+      await _tapAudioPlayer.setSource(AssetSource('sounds/tap.mp3'));
+      await _tapAudioPlayer.setReleaseMode(ReleaseMode.stop);
+    } catch (e) {
+      print('Error preloading tap sound: $e');
+    }
+  }
+
+  Future<void> _configureLowLatencyAudio() async {
+    try {
+      await _tapAudioPlayer.setPlayerMode(PlayerMode.lowLatency);
+    } catch (e) {
+      print('Low latency mode not supported: $e');
+    }
   }
 
   @override
   void dispose() {
     turnTimer?.cancel();
+    gameSubscription?.cancel();
+    quickMatchSubscription?.cancel();
+    roomCodeController.dispose();
     _audioPlayer.dispose();
+    _gameOverAudioPlayer.dispose();
+    _tapAudioPlayer.dispose();
     super.dispose();
   }
 
@@ -161,7 +1922,7 @@ class _GameScreenState extends State<GameScreen> {
     return Container(
       padding: EdgeInsets.symmetric(
         horizontal: isMobile ? 6 : 8,
-        vertical: isMobile ? 3 : 4,
+        vertical: isMobile ? 1 : 2, // REDUCED: was 3/4, now 1/2
       ),
       decoration: BoxDecoration(
         color: Colors.black.withOpacity(0.45),
@@ -174,22 +1935,28 @@ class _GameScreenState extends State<GameScreen> {
           ),
         ],
         border: Border.all(
-          color: const Color.fromARGB(153, 255, 214, 64).withOpacity(0.5),
+          color: const Color.fromARGB(153, 64, 182, 255).withOpacity(0.5),
           width: 1,
         ),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.tune, color: Colors.amberAccent, size: 15),
+          const Icon(
+            Icons.hdr_strong,
+            color: Color.fromARGB(255, 64, 182, 255),
+            size: 15,
+          ),
           SizedBox(width: isMobile ? 3 : 5),
           Text(
-            'Skill:',
+            ':',
             style: TextStyle(
-              color: const Color.fromARGB(192, 255, 214, 64),
+              color: const Color.fromARGB(192, 64, 182, 255),
               fontWeight: FontWeight.w500,
               fontSize: isMobile ? 9 : 11,
               letterSpacing: 0.7,
+              fontFamily: 'Roboto',
+              height: 1.0,
             ),
           ),
           SizedBox(width: isMobile ? 5 : 7),
@@ -197,20 +1964,41 @@ class _GameScreenState extends State<GameScreen> {
             value: aiDifficulty,
             dropdownColor: Colors.black87,
             style: const TextStyle(
-              color: Color.fromARGB(202, 255, 214, 64),
+              color: Color.fromARGB(201, 64, 182, 255),
               fontWeight: FontWeight.w500,
               fontSize: 11,
+              fontFamily: 'Roboto',
+              height: 1.0,
             ),
             underline: SizedBox.shrink(),
             icon: const Icon(
               Icons.arrow_drop_down,
-              color: Colors.amberAccent,
+              color: Color.fromARGB(255, 64, 182, 255),
               size: 15,
             ),
+            isDense: true, // ADDED: Makes dropdown more compact
             items: const [
-              DropdownMenuItem(value: 1, child: Text('Dull')),
-              DropdownMenuItem(value: 2, child: Text('Keen')),
-              DropdownMenuItem(value: 3, child: Text('Sharp')),
+              DropdownMenuItem(
+                value: 1,
+                child: Text(
+                  'Dull',
+                  style: TextStyle(fontFamily: 'Roboto'),
+                ),
+              ),
+              DropdownMenuItem(
+                value: 2,
+                child: Text(
+                  'Keen',
+                  style: TextStyle(fontFamily: 'Roboto'),
+                ),
+              ),
+              DropdownMenuItem(
+                value: 3,
+                child: Text(
+                  'Sharp',
+                  style: TextStyle(fontFamily: 'Roboto'),
+                ),
+              ),
             ],
             onChanged: (value) {
               setState(() {
@@ -227,75 +2015,433 @@ class _GameScreenState extends State<GameScreen> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        const Icon(
+        Icon(
           Icons.content_cut_sharp,
-          color: Color.fromARGB(255, 0, 255, 149),
+          color: Color.fromARGB(255, 0, 255, 183),
           size: 18,
+          shadows: [
+            Shadow(
+              color: Colors.black.withOpacity(0.6),
+              blurRadius: 4,
+              offset: Offset(1, 1),
+            ),
+          ],
         ),
         SizedBox(width: isMobile ? 4 : 6),
         Text(
-          'Streak: $winStreak',
+          ': $winStreak',
           style: TextStyle(
             color: const Color.fromARGB(255, 58, 255, 196),
             fontWeight: FontWeight.bold,
-            fontSize: isMobile ? 12 : 15,
+            fontSize: isMobile ? 16 : 18,
+            shadows: [
+              Shadow(
+                color: Colors.black.withOpacity(0.6),
+                blurRadius: 4,
+                offset: Offset(1, 1),
+              ),
+            ],
           ),
         ),
       ],
     );
   }
 
-  void _setupGame() {
-    fullDeck = [];
-    for (var value in [
-      '2',
-      '3',
-      '4',
-      '5',
-      '6',
-      '7',
-      '8',
-      '9',
-      '10',
-      'j',
-      'q',
-      'k',
-      'a',
-    ]) {
-      for (int i = 0; i < 4; i++) {
-        fullDeck.add(value);
+Widget buildHighScore({required bool isMobile}) {
+  return Row(
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+      Icon(
+        Icons.cut_sharp,
+        color: Color.fromARGB(255, 0, 195, 255),
+        size: 18,
+        shadows: [
+          Shadow(
+            color: Colors.black.withOpacity(0.6),
+            blurRadius: 4,
+            offset: Offset(1, 1),
+          ),
+        ],
+      ),
+      SizedBox(width: isMobile ? 4 : 6),
+      Text(
+        ': $highScore',
+        style: TextStyle(
+          color: Color.fromARGB(255, 0, 195, 255),
+          fontWeight: FontWeight.bold,
+          fontSize: isMobile ? 16 : 18,
+          shadows: [
+            Shadow(
+              color: Colors.black.withOpacity(0.6),
+              blurRadius: 4,
+              offset: Offset(1, 1),
+            ),
+          ],
+        ),
+      ),
+    ],
+  );
+}
+
+  void useMulliganModifier() {
+    if (!playerModifiers['mulligan']! && isPlayerTurn && !gameOver) {
+      HapticFeedback.lightImpact();
+
+      setState(() {
+        // Mark mulligan as used
+        playerModifiers['mulligan'] = true;
+
+        // Put current hand back into draw pile
+        playerDrawPile.addAll(playerHand);
+        playerHand.clear();
+
+        // Shuffle draw pile
+        playerDrawPile.shuffle(Random());
+
+        // Draw 2 new cards
+        safeDrawCards(playerHand, playerDrawPile, 2);
+
+        // Clear any current selections
+        clearSelections();
+
+        // Add to activity log
+        activityLog.add('You mulliganed');
+        activityLogColor = Colors.blueAccent;
+      });
+
+      // Update Firebase if in multiplayer - ENHANCE THIS
+      if (gameMode == 'human') {
+        _updateFirebaseMulliganState();
       }
+
+      playModifierSound();
     }
-    fullDeck.add('jkr');
-    fullDeck.add('jkr');
+  }
 
-    fullDeck.shuffle(Random());
-    playerDeck = fullDeck.sublist(0, 27);
-    opponentDeck = fullDeck.sublist(27, 54);
+// Add this new method
+  Future<void> _updateFirebaseMulliganState() async {
+    if (roomCode == null || playerId == null) return;
 
-    playerPrizeCards = playerDeck.sublist(0, 3);
-    opponentPrizeCards = opponentDeck.sublist(0, 3);
+    try {
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
 
-    playerHand = playerDeck.sublist(3, 5);
-    opponentHand = opponentDeck.sublist(3, 5);
+      await roomRef.update({
+        'playerHands/$playerId': List.from(playerHand),
+        'playerDrawPiles/$playerId': List.from(playerDrawPile),
+        'handSizes/$playerId': playerHand.length,
+        'drawPileSizes/$playerId': playerDrawPile.length,
+        'activityLog': List.from(activityLog)
+          ..add('$playerId used mulligan mod'),
+        'playerModifiers/$playerId': Map.from(playerModifiers),
+      });
+    } catch (e) {
+      print('Error updating mulligan state: $e');
+    }
+  }
 
-    playerDrawPile = playerDeck.sublist(5);
-    opponentDrawPile = opponentDeck.sublist(5);
+  double applyValueModifiers(double baseValue) {
+    double modifiedValue = baseValue;
 
-    field = [];
-    activityLog.clear(); // Add this line
-    fieldAceValue = null;
-    isPlayerTurn = true;
-    gameOver = false;
-    message = "Your turn!";
-    clearSelections();
-    setState(() {});
-    playerMaxHandSize = 2;
+    if (activePlayerModifier == '2x') {
+      modifiedValue *= 2;
+    } else if (activePlayerModifier == '+3') {
+      modifiedValue += 3;
+    }
 
-    // Don't start timer if showing initial overlay
-    if (!showInitialOverlay) {
-      turnTimer?.cancel();
-      startTimer();
+    return modifiedValue;
+  }
+
+  String _createPlayDescription(
+      List<String> playedCards, List<String> ops, List<int> aceOverrides) {
+    int aceOverrideIdx = 0;
+    return 'You played ${playedCards.asMap().entries.map((entry) {
+      int i = entry.key;
+      String card = entry.value;
+      String cardNum;
+      if (card == 'a' &&
+          aceOverrides.isNotEmpty &&
+          aceOverrideIdx < aceOverrides.length) {
+        cardNum = aceOverrides[aceOverrideIdx].toString();
+        aceOverrideIdx++;
+      } else {
+        cardNum = cardValue(card).toString().replaceAll('.0', '');
+      }
+      if (i == 0) return cardNum;
+      if (ops.isEmpty || (i - 1) >= ops.length || (i - 1) < 0) {
+        return ' $cardNum';
+      }
+      return ' ${ops[i - 1]} $cardNum';
+    }).join('')}';
+  }
+
+  void _useDrawModifier() {
+    if (!playerModifiers['draw1']! && isPlayerTurn && !gameOver) {
+      HapticFeedback.lightImpact();
+
+      setState(() {
+        // Mark draw1 as used
+        playerModifiers['draw1'] = true;
+
+        // Draw 1 extra card if available
+        if (playerDrawPile.isNotEmpty) {
+          playerHand.add(playerDrawPile.removeAt(0));
+          // Temporarily increase max hand size to accommodate the extra card
+          playerMaxHandSize = 3;
+        }
+
+        // Add to activity log
+        activityLog.add('You drew an extra card');
+        activityLogColor = Colors.blueAccent;
+      });
+
+      // Update Firebase if in multiplayer - ENHANCE THIS
+      if (gameMode == 'human') {
+        _updateFirebaseDraw1State();
+      }
+
+      playModifierSound();
+    }
+  }
+
+// Add this new method
+  Future<void> _updateFirebaseDraw1State() async {
+    if (roomCode == null || playerId == null) return;
+
+    try {
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      await roomRef.update({
+        'playerHands/$playerId': List.from(playerHand),
+        'playerDrawPiles/$playerId': List.from(playerDrawPile),
+        'handSizes/$playerId': playerHand.length,
+        'maxHandSizes/$playerId': playerMaxHandSize,
+        'drawPileSizes/$playerId': playerDrawPile.length,
+        'activityLog': List.from(activityLog)..add('$playerId used draw mod'),
+        'playerModifiers/$playerId': Map.from(playerModifiers),
+      });
+    } catch (e) {
+      print('Error updating draw1 state: $e');
+    }
+  }
+
+  void _useRewindModifier() {
+    if (!playerModifiers['rewind']! &&
+        isPlayerTurn &&
+        !gameOver &&
+        field.length > 1) {
+      HapticFeedback.lightImpact();
+
+      setState(() {
+        // Mark rewind as used
+        playerModifiers['rewind'] = true;
+
+        // Remove the last card from field
+        field.removeLast();
+
+        // Remove the corresponding ace value from history
+        if (fieldAceValueHistory.isNotEmpty) {
+          fieldAceValueHistory.removeLast();
+        }
+
+        // Restore proper ace value if the new last card is an ace
+        if (field.isNotEmpty && field.last == 'a') {
+          // Find the ace value from history for this position
+          if (fieldAceValueHistory.isNotEmpty) {
+            fieldAceValue = fieldAceValueHistory.last;
+          } else {
+            fieldAceValue = null; // Fallback
+          }
+        } else {
+          fieldAceValue = null;
+        }
+
+        // Add to activity log
+        activityLog.add('You rewound the field');
+        activityLogColor = Colors.blueAccent;
+      });
+
+      // Update Firebase if in multiplayer
+      if (gameMode == 'human') {
+        _updateFirebaseRewindState();
+      }
+
+      playModifierSound();
+    }
+  }
+
+// Add this new method
+  Future<void> _updateFirebaseRewindState() async {
+    if (roomCode == null || playerId == null) return;
+
+    try {
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      await roomRef.update({
+        'field': List.from(field),
+        'fieldAceValue': fieldAceValue,
+        'activityLog': List.from(activityLog)..add('$playerId used rewind mod'),
+        'playerModifiers/$playerId': Map.from(playerModifiers),
+      });
+    } catch (e) {
+      print('Error updating rewind state: $e');
+    }
+  }
+
+  void _useModifier(String modifierType) {
+    if (modifierType == 'mulligan') {
+      useMulliganModifier();
+    } else if (modifierType == '2x' ||
+        modifierType == '+3' ||
+        modifierType == '-3' ||
+        modifierType == '-1' ||
+        modifierType == '+1' ||
+        modifierType == '+11' ||
+        modifierType == '-0.5') {
+      _selectValueModifier(modifierType);
+    } else if (modifierType == 'draw1') {
+      _useDrawModifier();
+    } else if (modifierType == 'rewind') {
+      _useRewindModifier();
+    }
+  }
+
+  void _selectValueModifier(String modifierType) {
+    if (!playerModifiers[modifierType]! && isPlayerTurn && !gameOver) {
+      HapticFeedback.lightImpact();
+
+      setState(() {
+        // Toggle the modifier selection
+        if (activePlayerModifier == modifierType) {
+          // Deselect if already selected
+          activePlayerModifier = null;
+          showModifierSelection = false;
+        } else {
+          // Select this modifier
+          activePlayerModifier = modifierType;
+          showModifierSelection = true;
+        }
+      });
+
+      // Add to activity log
+      if (activePlayerModifier == modifierType) {
+        activityLog.add('Selected $modifierType mod');
+        activityLogColor = Colors.blueAccent;
+      } else {
+        activityLog.add('Mod deselected');
+        activityLogColor = Colors.white;
+      }
+
+      // Update Firebase if in multiplayer
+      if (gameMode == 'human') {
+        _updateFirebaseModifierState();
+      }
+
+      playModifierSound();
+    }
+  }
+
+  Future<void> _updateFirebaseModifierState() async {
+    if (roomCode == null || playerId == null) return;
+
+    try {
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      // Prepare updates based on which modifiers are used
+      Map<String, dynamic> updates = {
+        'playerModifiers/$playerId': Map.from(playerModifiers),
+      };
+
+      // Add activity log update
+      if (activityLog.isNotEmpty) {
+        updates['activityLog'] = List.from(activityLog);
+      }
+
+      // Add active modifier state
+      if (activePlayerModifier != null) {
+        updates['activeModifiers/$playerId'] = activePlayerModifier;
+      } else {
+        updates['activeModifiers/$playerId'] = null;
+      }
+
+      await roomRef.update(updates);
+    } catch (e) {
+      print('Error updating modifier state: $e');
+    }
+  }
+
+  void _setupGame() {
+    // Rotate to next background
+    setState(() {
+      currentBackgroundIndex =
+          (currentBackgroundIndex + 1) % backgrounds.length;
+    });
+    try {
+      fullDeck = _createFullDeck();
+      fullDeck.shuffle(Random());
+
+      playerDeck = fullDeck.sublist(0, 34);
+      opponentDeck = fullDeck.sublist(34, 68);
+
+      playerPrizeCards = playerDeck.sublist(0, 3);
+      opponentPrizeCards = opponentDeck.sublist(0, 3);
+
+      playerHand = playerDeck.sublist(3, 5);
+      opponentHand = opponentDeck.sublist(3, 5);
+      opponentActualHand = gameMode == 'ai' ? List.from(opponentHand) : [];
+
+      playerDrawPile = playerDeck.sublist(5);
+      opponentDrawPile = opponentDeck.sublist(5);
+      opponentActualDrawPile =
+          gameMode == 'ai' ? List.from(opponentDrawPile) : [];
+
+      // Initialize card counting for new game
+      playedCardCounts.clear();
+      gameHistory.clear();
+      playerPlayPatterns.clear();
+      totalCardsPlayed = 0;
+
+      // Initialize all card counts to 0
+      for (String cardValue in [
+        '2',
+        '3',
+        '4',
+        '5',
+        '6',
+        '7',
+        '8',
+        '9',
+        '10',
+        'j',
+        'q',
+        'k',
+        'a',
+        'jkr'
+      ]) {
+        playedCardCounts[cardValue] = 0;
+      }
+
+      // Reset modifiers for new game - UPDATED to use random assignment
+      _assignRandomModifiers();
+
+      activePlayerModifier = null;
+      showModifierSelection = false;
+
+      _resetGameState();
+      isPlayerTurn = true;
+      message = "Your turn!";
+
+      setState(() {});
+
+      if (!showInitialOverlay) {
+        turnTimer?.cancel();
+        startTimer();
+      }
+    } catch (e) {
+      print('Error setting up game: $e');
     }
   }
 
@@ -322,14 +2468,9 @@ class _GameScreenState extends State<GameScreen> {
     return result;
   }
 
-  // --- UPDATED: Add fieldAceValue as an optional named parameter ---
-  bool isValidPlay(
-    List<String> playedCards,
-    List<String> ops,
-    String lastFieldCard,
-    List<int>? aceOverrides, {
-    int? fieldAceValue,
-  }) {
+  bool isValidPlay(List<String> playedCards, List<String> ops,
+      String lastFieldCard, List<int>? aceOverrides,
+      {int? fieldAceValue, String? appliedModifier}) {
     aceOverrides = aceOverrides ?? [];
 
     if (playedCards.isEmpty || playedCards.length > 3) return false;
@@ -337,66 +2478,123 @@ class _GameScreenState extends State<GameScreen> {
       return false;
     }
 
-    List<double> values = [];
-    int aceIdx = 0;
-    for (int i = 0; i < playedCards.length; i++) {
-      if (playedCards[i] == 'a') {
-        int aceValue = 14;
-        if (aceIdx < aceOverrides.length) {
-          aceValue = aceOverrides[aceIdx];
-        }
-        values.add(cardValue('a', aceOverride: aceValue));
-        aceIdx++;
-      } else {
-        values.add(cardValue(playedCards[i]));
-      }
-    }
-
-    // Ensure the smallest value card is last (top of field stack)
-    double minValue = values.reduce(min);
-    int minIdx = values.indexOf(minValue);
-    if (minIdx != values.length - 1) {
-      // Move the smallest value card to the end
-      String tempCard = playedCards[minIdx];
-      playedCards.removeAt(minIdx);
-      playedCards.add(tempCard);
-
-      // Also reorder aceOverrides if needed
-      if (playedCards[playedCards.length - 1] == 'a' &&
-          aceOverrides.isNotEmpty &&
-          minIdx < aceOverrides.length) {
-        int tempAce = aceOverrides[minIdx];
-        aceOverrides.removeAt(minIdx);
-        aceOverrides.add(tempAce);
-      }
-      // Rebuild values to match new order
-      values = [];
-      aceIdx = 0;
+    // NEW: Check that cards are played in descending order (largest to smallest)
+    if (playedCards.length > 1) {
+      List<double> originalValues = [];
+      int aceIdx = 0;
       for (int i = 0; i < playedCards.length; i++) {
         if (playedCards[i] == 'a') {
           int aceValue = 14;
           if (aceIdx < aceOverrides.length) {
             aceValue = aceOverrides[aceIdx];
           }
-          values.add(cardValue('a', aceOverride: aceValue));
+          originalValues.add(cardValue('a', aceOverride: aceValue));
           aceIdx++;
         } else {
-          values.add(cardValue(playedCards[i]));
+          originalValues.add(cardValue(playedCards[i]));
+        }
+      }
+
+      // Check if cards are in descending order
+      for (int i = 0; i < originalValues.length - 1; i++) {
+        if (originalValues[i] < originalValues[i + 1]) {
+          return false; // Invalid: smaller number comes before larger
         }
       }
     }
 
-    double result = values[0];
-    for (int i = 1; i < values.length; i++) {
-      if (i - 1 < ops.length && ops[i - 1] == '+') {
-        result += values[i];
-      } else if (i - 1 < ops.length) {
-        result -= values[i];
+    // Create copies to avoid modifying originals
+    List<String> cardsCopy = List.from(playedCards);
+    List<int> aceOverridesCopy = List.from(aceOverrides);
+
+    List<double> values = [];
+    int aceIdx = 0;
+    for (int i = 0; i < cardsCopy.length; i++) {
+      if (cardsCopy[i] == 'a') {
+        int aceValue = 14;
+        if (aceIdx < aceOverridesCopy.length) {
+          aceValue = aceOverridesCopy[aceIdx];
+        }
+        values.add(cardValue('a', aceOverride: aceValue));
+        aceIdx++;
+      } else {
+        values.add(cardValue(cardsCopy[i]));
       }
-      // If ops doesn't have enough elements, skip the operation
     }
 
-    // --- UPDATED: Use fieldAceValue if the field card is an Ace ---
+    double minValue = values.reduce(min);
+    int minIdx = values.indexOf(minValue);
+    if (minIdx != values.length - 1) {
+      String tempCard = cardsCopy[minIdx];
+      cardsCopy.removeAt(minIdx);
+      cardsCopy.add(tempCard);
+
+      if (cardsCopy[cardsCopy.length - 1] == 'a' &&
+          aceOverridesCopy.isNotEmpty &&
+          minIdx < aceOverridesCopy.length) {
+        int tempAce = aceOverridesCopy[minIdx];
+        aceOverridesCopy.removeAt(minIdx);
+        aceOverridesCopy.add(tempAce);
+      }
+
+      values = [];
+      int aceIdx2 = 0;
+      for (int i = 0; i < cardsCopy.length; i++) {
+        if (cardsCopy[i] == 'a') {
+          int aceValue = 14;
+          if (aceIdx2 < aceOverridesCopy.length) {
+            aceValue = aceOverridesCopy[aceIdx2];
+          }
+          values.add(cardValue('a', aceOverride: aceValue));
+          aceIdx2++;
+        } else {
+          values.add(cardValue(cardsCopy[i]));
+        }
+      }
+    }
+
+    // Use original values and order for calculation
+    List<double> originalValues = [];
+    int aceIdx3 = 0;
+    for (int i = 0; i < playedCards.length; i++) {
+      if (playedCards[i] == 'a') {
+        int aceValue = 14;
+        if (aceIdx3 < aceOverrides.length) {
+          aceValue = aceOverrides[aceIdx3];
+        }
+        originalValues.add(cardValue('a', aceOverride: aceValue));
+        aceIdx3++;
+      } else {
+        originalValues.add(cardValue(playedCards[i]));
+      }
+    }
+
+    double result = originalValues[0];
+    for (int i = 1; i < originalValues.length; i++) {
+      if (i - 1 < ops.length && ops[i - 1] == '+') {
+        result += originalValues[i];
+      } else if (i - 1 < ops.length) {
+        result -= originalValues[i];
+      }
+    }
+
+    if (appliedModifier == '2x') {
+      result *= 2;
+    } else if (appliedModifier == '+3') {
+      result += 3;
+    } else if (appliedModifier == '-3') {
+      result -= 3;
+    } else if (appliedModifier == '-1') {
+      result -= 1;
+    } else if (appliedModifier == '+1') {
+      result += 1;
+    } else if (appliedModifier == '+11') {
+      result += 11;
+    } else if (appliedModifier == '-0.5') {
+      result -= 0.5;
+    }
+    // Note: draw1 and rewind don't affect the calculation result
+
     double lastVal;
     if (lastFieldCard == 'a' && fieldAceValue != null) {
       lastVal = cardValue('a', aceOverride: fieldAceValue);
@@ -407,24 +2605,152 @@ class _GameScreenState extends State<GameScreen> {
     return (result == lastVal * 2) || (result == lastVal / 2);
   }
 
+  Map<String, double> _calculateRemainingCardProbabilities() {
+    Map<String, double> probabilities = {};
+
+    try {
+      final startTime = DateTime.now();
+      const maxCalculationTime = Duration(milliseconds: 100);
+
+      for (String cardValue in [
+        '2',
+        '3',
+        '4',
+        '5',
+        '6',
+        '7',
+        '8',
+        '9',
+        '10',
+        'j',
+        'q',
+        'k',
+        'a'
+      ]) {
+        // Check timeout
+        if (DateTime.now().difference(startTime) > maxCalculationTime) {
+          print('Probability calculation timeout - returning partial results');
+          break;
+        }
+
+        int totalInDeck = cardValue == 'jkr' ? 3 : 5;
+        int played = playedCardCounts[cardValue] ?? 0;
+
+        // Bounds checking to prevent invalid states
+        if (played < 0 || played > totalInDeck) {
+          print('Invalid played count for $cardValue: $played');
+          played = played.clamp(0, totalInDeck);
+        }
+
+        int remaining = totalInDeck - played;
+
+        // Calculate probability this card is in player's hand or draw pile
+        int totalUnknownCards = playerHand.length + playerDrawPile.length;
+        probabilities[cardValue] =
+            totalUnknownCards > 0 ? remaining / totalUnknownCards : 0.0;
+      }
+    } catch (e) {
+      print('Error in probability calculation: $e');
+      return {}; // Return empty map as fallback
+    }
+
+    return probabilities;
+  }
+
+  double _evaluatePlayStrategically(Map<String, dynamic> play,
+      Map<String, double> cardProbabilities, double playerThreatLevel) {
+    try {
+      final startTime = DateTime.now();
+      const maxEvaluationTime = Duration(milliseconds: 50);
+
+      double baseScore = play['score'].toDouble() * 10; // Base prize card value
+      List<String> cards = play['cards'];
+
+      // Bounds checking
+      if (cards.isEmpty) return baseScore;
+
+      // Bonus for card efficiency (fewer cards used)
+      double efficiencyBonus = (4 - cards.length) * 2;
+
+      // Penalty for playing high-value cards when player likely has counters
+      double conservationPenalty = 0;
+      for (String card in cards) {
+        if (['k', 'q', 'j', '10'].contains(card)) {
+          conservationPenalty +=
+              playerThreatLevel * 3; // Higher penalty if player is threatening
+        }
+      }
+
+      // Bonus for creating difficult target values for player
+      double targetDifficultyBonus = 0;
+      if (cards.isNotEmpty && cardProbabilities.isNotEmpty) {
+        String resultCard = cards.last; // Card that will be left on field
+        double cardVal = cardValue(resultCard);
+
+        // Check if target values (double/half) are likely hard for player to hit
+        List<double> targets = [cardVal * 2, cardVal / 2];
+        for (double target in targets) {
+          // Check timeout during nested loops
+          if (DateTime.now().difference(startTime) > maxEvaluationTime) {
+            print('Strategic evaluation timeout - using partial results');
+            break;
+          }
+
+          bool targetIsHard = true;
+          // Limit the search to prevent excessive loops
+          int checkedCards = 0;
+          for (String possibleCard in cardProbabilities.keys) {
+            if (checkedCards++ > 20) break; // Limit iterations
+
+            if (cardValue(possibleCard) == target &&
+                (cardProbabilities[possibleCard] ?? 0) > 0.2) {
+              targetIsHard = false;
+              break;
+            }
+          }
+          if (targetIsHard) targetDifficultyBonus += 2;
+        }
+      }
+
+      return baseScore +
+          efficiencyBonus -
+          conservationPenalty +
+          targetDifficultyBonus;
+    } catch (e) {
+      print('Error in strategic evaluation: $e');
+      return play['score'].toDouble() * 10; // Fallback to base score
+    }
+  }
+
   void checkForWin() {
+    if (gameOver) return; // Add this line to prevent duplicate calls
+
     if (playerPrizeCards.isEmpty) {
+      HapticFeedback.mediumImpact();
       setState(() {
         message = "You win!";
         isPlayerTurn = false;
         gameOver = true;
         winner = 'player';
-        if (aiDifficulty == 3) {
+        // Update win streak for both multiplayer and AI difficulty 3
+        if (gameMode == 'human' || aiDifficulty == 3) {
           winStreak += 1;
+          _checkAndUpdateHighScore();
         }
         clearSelections();
       });
       turnTimer?.cancel();
-      // Add a small delay before playing sound
+
+// Sync game over state to Firebase
+      if (gameMode == 'human') {
+        _updateFirebaseGameOverState('player');
+      }
+
       Future.delayed(const Duration(milliseconds: 100), () {
         playGameWinSound();
       });
     } else if (opponentPrizeCards.isEmpty) {
+      HapticFeedback.mediumImpact();
       setState(() {
         message = "Opponent wins!";
         isPlayerTurn = false;
@@ -434,15 +2760,39 @@ class _GameScreenState extends State<GameScreen> {
         clearSelections();
       });
       turnTimer?.cancel();
+
+// Sync game over state to Firebase
+      if (gameMode == 'human') {
+        _updateFirebaseGameOverState('opponent');
+      }
+
       Future.delayed(const Duration(milliseconds: 100), () {
         playGameLossSound();
       });
     }
   }
 
+  Future<void> _updateFirebaseGameOverState(String winner) async {
+    if (roomCode == null || playerId == null) return;
+
+    try {
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      await roomRef.update({
+        'gameState': 'gameOver',
+        'winner': winner == 'player' ? playerId : opponentId,
+        'winnerMessage': winner == 'player' ? 'You win!' : 'Opponent wins!',
+        'rematchRequests': {}, // Reset rematch requests
+      });
+    } catch (e) {
+      print('Error updating Firebase game over state: $e');
+    }
+  }
+
   Future<void> playCardSound() async {
     try {
-      await _audioPlayer.stop(); // Stop any current sound
+      await _audioPlayer.stop();
       await _audioPlayer.play(AssetSource('sounds/cardplay.mp3'));
       print('Card sound played');
     } catch (e) {
@@ -462,8 +2812,7 @@ class _GameScreenState extends State<GameScreen> {
 
   Future<void> playGameWinSound() async {
     try {
-      await _audioPlayer.stop();
-      await _audioPlayer.play(AssetSource('sounds/gamewin.mp3'));
+      await _gameOverAudioPlayer.play(AssetSource('sounds/gamewin.mp3'));
       print('Game win sound played');
     } catch (e) {
       print('Error playing game win sound: $e');
@@ -472,27 +2821,54 @@ class _GameScreenState extends State<GameScreen> {
 
   Future<void> playGameLossSound() async {
     try {
-      await _audioPlayer.stop();
-      await _audioPlayer.play(AssetSource('sounds/gameloss.mp3'));
+      await _gameOverAudioPlayer.play(AssetSource('sounds/gameloss.mp3'));
       print('Game loss sound played');
     } catch (e) {
       print('Error playing game loss sound: $e');
     }
   }
 
+  Future<void> playModifierSound() async {
+    try {
+      await _audioPlayer.stop();
+      await _audioPlayer.play(AssetSource('sounds/modplay.mp3'));
+      print('Modifier sound played');
+    } catch (e) {
+      print('Error playing modifier sound: $e');
+    }
+  }
+
+  Future<void> playTapSound() async {
+    try {
+      await _tapAudioPlayer.stop();
+      await _tapAudioPlayer.resume();
+    } catch (e) {
+      print('Error playing tap sound: $e');
+    }
+  }
+
   void startTimer() {
     turnTimer?.cancel();
 
-    // Set timerSeconds based on difficulty
+    int baseTime;
     if (aiDifficulty == 1) {
-      timerSeconds = 10; // Dull
+      baseTime = 10;
     } else if (aiDifficulty == 2) {
-      timerSeconds = 8; // Keen
+      baseTime = 8;
     } else {
-      timerSeconds = 6; // Sharp
+      baseTime = 6;
     }
 
-    setState(() {}); // Update UI if needed
+    if (gameMode == 'human') {
+      timerSeconds = 5; // Set your desired multiplayer time here
+    } else if (aiDifficulty == 3) {
+      int timeReduction = (winStreak).clamp(0, 3);
+      timerSeconds = (baseTime - timeReduction).clamp(4, baseTime);
+    } else {
+      timerSeconds = baseTime;
+    }
+
+    setState(() {});
 
     turnTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (!mounted) return;
@@ -503,8 +2879,6 @@ class _GameScreenState extends State<GameScreen> {
         turnTimer?.cancel();
         if (isPlayerTurn && !gameOver) {
           handlePlayerTimeout();
-        } else if (!isPlayerTurn && !gameOver) {
-          handleOpponentTimeout();
         }
       }
     });
@@ -513,57 +2887,195 @@ class _GameScreenState extends State<GameScreen> {
   void handlePlayerTimeout() {
     setState(() {
       message = "Time's up!";
+      clearSelections();
+      activePlayerModifier = null;
+      showModifierSelection = false;
+    });
+
+    // NEW: Close ace dialog if it's open
+    if (_aceDialogOpen && mounted) {
+      Navigator.of(context).pop();
+      _aceDialogOpen = false;
+    }
+
+    if (gameMode == 'human') {
+      _updateTimeoutPenaltyToFirebase().then((_) {
+        if (mounted && !gameOver) {
+          setState(() {
+            isPlayerTurn = false;
+            message = "You timed out - opponent gets a prize card!";
+          });
+        }
+      }).catchError((error) {
+        print('Error updating timeout penalty: $error');
+        if (mounted && !gameOver) {
+          setState(() {
+            isPlayerTurn = false;
+            message = "Time's up - opponent's turn!";
+          });
+          _updateFirebaseGameState();
+        }
+      });
+    } else if (!gameOver && gameMode == 'ai') {
+      // AI mode - opponent (AI) gets a prize card when human times out
       if (opponentPrizeCards.isNotEmpty) {
         opponentPrizeCards.removeLast();
-        print('Opponent wins a prize card due to timeout!');
-        playPrizeCardSound(); // Add sound for timeout penalty
+        print('AI gets a prize card due to human timeout!');
+        playPrizeCardSound();
         checkForWin();
       }
       isPlayerTurn = false;
-      clearSelections();
-    });
-    if (!gameOver) {
       Future.delayed(const Duration(seconds: 1), opponentTurn);
     }
   }
 
+  Future<void> _updateTimeoutPenaltyToFirebase() async {
+    if (roomCode == null || opponentId == null || playerId == null) return;
+
+    print(
+        'DEBUG TIMEOUT: Player $playerId timed out - opponent $opponentId gets prize card');
+
+    try {
+      final DatabaseReference roomRef =
+          FirebaseDatabase.instance.ref('rooms/$roomCode');
+
+      final result = await roomRef.runTransaction((Object? current) {
+        if (current == null) {
+          print('DEBUG TIMEOUT: Transaction aborted - room no longer exists');
+          return Transaction.abort();
+        }
+
+        final data = current as Map<dynamic, dynamic>;
+        final currentTurn = data['turn'] as String?;
+        final currentGameState = data['gameState'] as String?;
+
+        print('DEBUG TIMEOUT: Current turn: $currentTurn, My ID: $playerId');
+        print('DEBUG TIMEOUT: Game state: $currentGameState');
+
+        if (currentTurn != playerId || currentGameState == 'gameOver') {
+          print('DEBUG TIMEOUT: Aborting - wrong turn or game over');
+          return Transaction.abort();
+        }
+
+        // Initialize nested maps if they don't exist
+        data['prizeCardCounts'] ??= {};
+        data['playerPrizeCards'] ??= {};
+        data['activityLog'] ??= [];
+
+        // Get current OPPONENT prize count (opponent should get a prize card)
+        final currentOpponentPrizeCount =
+            (data['prizeCardCounts'] as Map)[opponentId] as int? ?? 3;
+        print(
+            'DEBUG TIMEOUT: Opponent current prize count: $currentOpponentPrizeCount');
+
+        // Decrease OPPONENT's prize card count (they draw a prize card - get closer to winning)
+        final newOpponentPrizeCount =
+            (currentOpponentPrizeCount > 0) ? currentOpponentPrizeCount - 1 : 0;
+        (data['prizeCardCounts'] as Map)[opponentId] = newOpponentPrizeCount;
+
+        // Update the OPPONENT's prize cards list
+        final currentOpponentPrizeCards =
+            (data['playerPrizeCards'] as Map)[opponentId] as List<dynamic>? ??
+                List.generate(currentOpponentPrizeCount, (_) => 'cardback');
+
+        // Create a mutable copy to avoid fixed-length list error
+        final mutablePrizeCards = List<dynamic>.from(currentOpponentPrizeCards);
+
+        if (mutablePrizeCards.isNotEmpty) {
+          mutablePrizeCards.removeLast();
+        }
+        (data['playerPrizeCards'] as Map)[opponentId] = mutablePrizeCards;
+
+        print(
+            'DEBUG TIMEOUT: Setting opponent prize count to: $newOpponentPrizeCount');
+
+        // Add timeout message to activity log
+        final currentActivityLog = List<String>.from(
+            (data['activityLog'] as List? ?? []).cast<String>());
+        currentActivityLog
+            .add('$playerId timed out - $opponentId gets prize card!');
+        data['activityLog'] = currentActivityLog;
+
+        // Add timeout penalty marker - but now it means "opponent benefited"
+        final timeoutId = DateTime.now().millisecondsSinceEpoch.toString();
+        data['lastTimeoutPenalty'] = {
+          'timeoutPlayer': playerId, // Player who timed out
+          'benefitPlayer': opponentId, // Player who got the prize card
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+          'id': timeoutId,
+        };
+
+        // Switch turn to opponent
+        data['turn'] = opponentId;
+
+        print('DEBUG TIMEOUT: Transaction data prepared successfully');
+        return Transaction.success(data);
+      });
+
+      if (result.committed) {
+        print('DEBUG TIMEOUT: Transaction committed successfully');
+      } else {
+        print('DEBUG TIMEOUT: Transaction failed to commit');
+        throw Exception('Transaction failed to commit');
+      }
+    } catch (e) {
+      print('DEBUG TIMEOUT: Error updating timeout penalty: $e');
+      rethrow;
+    }
+  }
+
   void handleOpponentTimeout() {
+    // This method should only be called in AI mode
+    // In multiplayer, opponent timeout is handled via Firebase sync
+    if (gameMode != 'ai') return;
+
     setState(() {
-      message = "Opponent timed out! You draw a prize card.";
+      message = "Opponent ran out of time!";
       if (playerPrizeCards.length < 3) {
         playerPrizeCards.add('prize');
-        playPrizeCardSound(); // Add sound when player gets penalty prize
+        playPrizeCardSound();
       }
       isPlayerTurn = true;
     });
+
     startTimer();
   }
 
   Future<List<int>> promptForAceValues(List<String> playedCards) async {
     List<int> aceOverrides = [];
+
     for (var card in playedCards) {
       if (card == 'a') {
+        setState(() {
+          _aceDialogOpen = true;
+        });
+
         int? aceValue = await showDialog<int>(
           context: context,
+          barrierDismissible: false, // Prevent dismissing by tapping outside
           builder: (context) => AlertDialog(
             backgroundColor: Colors.black.withOpacity(0.9),
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(18),
-              side: const BorderSide(color: Colors.amberAccent, width: 1.5),
+              side: const BorderSide(
+                color: Color.fromARGB(255, 64, 182, 255),
+                width: 1.5,
+              ),
             ),
             title: const Text(
               'Choose Value',
-              textAlign: TextAlign.center, // Center the title
+              textAlign: TextAlign.center,
               style: TextStyle(
-                color: Colors.amberAccent,
+                color: Color.fromARGB(255, 64, 182, 255),
                 fontWeight: FontWeight.bold,
                 fontSize: 18,
                 letterSpacing: 1.1,
+                fontFamily: 'Roboto',
               ),
             ),
             content: const Text(
               '1 or 14?',
-              textAlign: TextAlign.center, // Center the content
+              textAlign: TextAlign.center,
               style: TextStyle(color: Colors.white70, fontSize: 15),
             ),
             actionsAlignment: MainAxisAlignment.spaceEvenly,
@@ -571,21 +3083,27 @@ class _GameScreenState extends State<GameScreen> {
               TextButton(
                 style: TextButton.styleFrom(
                   backgroundColor: Colors.grey[900],
-                  foregroundColor: Colors.amberAccent,
+                  foregroundColor: const Color.fromARGB(255, 64, 182, 255),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(10),
                   ),
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 18,
-                    vertical: 8,
+                    horizontal: 32, // Increased from 18
+                    vertical: 16, // Increased from 8
                   ),
+                  minimumSize: const Size(80, 56), // Added minimum size
                 ),
-                onPressed: () => Navigator.of(context).pop(1),
+                onPressed: () {
+                  setState(() {
+                    _aceDialogOpen = false;
+                  });
+                  Navigator.of(context).pop(1);
+                },
                 child: const Text(
                   '1',
                   style: TextStyle(
                     fontWeight: FontWeight.bold,
-                    fontSize: 16,
+                    fontSize: 24, // Increased from 16
                     letterSpacing: 1.2,
                   ),
                 ),
@@ -593,21 +3111,27 @@ class _GameScreenState extends State<GameScreen> {
               TextButton(
                 style: TextButton.styleFrom(
                   backgroundColor: Colors.grey[900],
-                  foregroundColor: Colors.amberAccent,
+                  foregroundColor: const Color.fromARGB(255, 64, 182, 255),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(10),
                   ),
                   padding: const EdgeInsets.symmetric(
-                    horizontal: 18,
-                    vertical: 8,
+                    horizontal: 32, // Increased from 18
+                    vertical: 16, // Increased from 8
                   ),
+                  minimumSize: const Size(80, 56), // Added minimum size
                 ),
-                onPressed: () => Navigator.of(context).pop(14),
+                onPressed: () {
+                  setState(() {
+                    _aceDialogOpen = false;
+                  });
+                  Navigator.of(context).pop(14);
+                },
                 child: const Text(
                   '14',
                   style: TextStyle(
                     fontWeight: FontWeight.bold,
-                    fontSize: 16,
+                    fontSize: 24, // Increased from 16
                     letterSpacing: 1.2,
                   ),
                 ),
@@ -615,80 +3139,150 @@ class _GameScreenState extends State<GameScreen> {
             ],
           ),
         );
+
+        setState(() {
+          _aceDialogOpen = false;
+        });
+
+        // Check if turn ended while dialog was open
+        if (!isPlayerTurn || gameOver) {
+          // Turn ended, return default values for remaining aces
+          aceOverrides.add(14); // Default to 14
+          int remainingAces =
+              playedCards.where((c) => c == 'a').length - aceOverrides.length;
+          for (int i = 0; i < remainingAces; i++) {
+            aceOverrides.add(14);
+          }
+          break;
+        }
+
         aceOverrides.add(aceValue ?? 14);
       }
     }
+
+    // Ensure we have values for all aces
     int aceCount = playedCards.where((c) => c == 'a').length;
     while (aceOverrides.length < aceCount) {
       aceOverrides.add(14);
     }
+
     return aceOverrides;
+  }
+
+  void _trackPlayedCards(List<String> cards, bool isPlayer) {
+    for (String card in cards) {
+      playedCardCounts[card] = (playedCardCounts[card] ?? 0) + 1;
+      gameHistory.add(card);
+      totalCardsPlayed++;
+
+      // Track player patterns specifically
+      if (isPlayer) {
+        playerPlayPatterns[card] = (playerPlayPatterns[card] ?? 0) + 1;
+      }
+    }
   }
 
   Future<void> playSelectedCards() async {
     if (!isPlayerTurn || gameOver || selectedIndices.isEmpty) return;
 
-    turnTimer?.cancel();
+    // Add Firebase turn validation for multiplayer
+    if (gameMode == 'human' && roomCode != null) {
+      try {
+        final roomRef = FirebaseDatabase.instance.ref('rooms/$roomCode');
+        final snapshot = await roomRef.child('turn').get();
+        final currentTurn = snapshot.value as String?;
 
-    // Defensive: Remove any invalid indices before playing
+        if (currentTurn != playerId) {
+          setState(() {
+            message = "Not your turn!";
+            clearSelections();
+          });
+          return;
+        }
+      } catch (e) {
+        print('Error validating turn: $e');
+        return;
+      }
+    }
+
+    // Handle rewind modifier
+    if (activePlayerModifier == 'rewind') {
+      if (field.length > 1) {
+        setState(() {
+          field.removeLast();
+
+          // Remove the corresponding ace value from history
+          if (fieldAceValueHistory.isNotEmpty) {
+            fieldAceValueHistory.removeLast();
+          }
+
+          // Restore proper ace value if the new last card is an ace
+          if (field.isNotEmpty && field.last == 'a') {
+            if (fieldAceValueHistory.isNotEmpty) {
+              fieldAceValue = fieldAceValueHistory.last;
+            } else {
+              fieldAceValue = null;
+            }
+          } else {
+            fieldAceValue = null;
+          }
+
+          playerModifiers['rewind'] = true;
+          activePlayerModifier = null;
+          activityLog.add('Field rewound!');
+        });
+        // Continue with normal play - do NOT return here
+      }
+    }
+
+    // Handle draw1 modifier
+    if (activePlayerModifier == 'draw1') {
+      setState(() {
+        playerMaxHandSize = 3; // Temporarily increase hand size
+        safeDrawCards(playerHand, playerDrawPile, 1);
+        playerModifiers['draw1'] = true;
+        activePlayerModifier = null;
+        activityLog.add('Drew extra card!');
+      });
+      // Continue with normal play
+    }
+
+    HapticFeedback.lightImpact();
+
     selectedIndices.removeWhere((i) => i < 0 || i >= playerHand.length);
 
-    // If after sanitizing, the selection is not valid, bail out
     if (!isSelectionValidForPlay()) {
       print(
-        'Invalid selection: $selectedIndices for playerHand of length ${playerHand.length}',
-      );
+          'Invalid selection: $selectedIndices for playerHand of length ${playerHand.length}');
       clearSelections();
       return;
     }
 
-    List<String> playedCards = selectedIndices
-        .map((i) => playerHand[i])
-        .toList();
+    List<String> playedCards =
+        selectedIndices.map((i) => playerHand[i]).toList();
     List<int> aceOverrides = await promptForAceValues(playedCards);
 
-    // CRITICAL: Re-validate after async dialog - hand may have changed!
+    turnTimer?.cancel();
+
     if (!isPlayerTurn || gameOver) {
       print('Game state changed during ace selection, canceling play');
       clearSelections();
       return;
     }
 
-    // Re-validate indices after the async operation
+    // Validate all indices are still valid
     List<int> originalIndices = List.from(selectedIndices);
     selectedIndices.removeWhere((i) => i < 0 || i >= playerHand.length);
 
-    if (selectedIndices.isEmpty) {
-      print(
-        'All selections became invalid during ace selection (hand length: ${playerHand.length}, original indices: $originalIndices)',
-      );
+    if (selectedIndices.isEmpty ||
+        selectedIndices.length != originalIndices.length) {
+      print('Selections became invalid during ace selection');
       clearSelections();
       return;
     }
 
-    if (selectedIndices.length != originalIndices.length) {
-      print(
-        'Some selections became invalid during ace selection, clearing all selections for safety',
-      );
-      clearSelections();
-      return;
-    }
-
-    // Final validation before proceeding
-    for (int i = 0; i < selectedIndices.length; i++) {
-      if (selectedIndices[i] < 0 || selectedIndices[i] >= playerHand.length) {
-        print(
-          'FINAL VALIDATION FAILED: selectedIndices[$i]=${selectedIndices[i]} out of bounds for hand length ${playerHand.length}',
-        );
-        clearSelections();
-        return;
-      }
-    }
-
-    // Rebuild playedCards with current valid indices
     playedCards = selectedIndices.map((i) => playerHand[i]).toList();
 
-    // Ensure selectedOps has the correct number of operations for the number of cards selected
     while (selectedOps.length < selectedIndices.length - 1) {
       selectedOps.add('+');
     }
@@ -696,297 +3290,182 @@ class _GameScreenState extends State<GameScreen> {
       selectedOps.removeLast();
     }
 
-    print('DEBUG: playedCards: $playedCards');
-    print('DEBUG: selectedOps: $selectedOps');
-    print('DEBUG: selectedIndices: $selectedIndices');
-    print('DEBUG: playerHand.length: ${playerHand.length}');
+    if (gameMode == 'ai') {
+      _trackPlayedCards(playedCards, true);
+    }
 
-    // SAVE the selectedOps BEFORE clearing selections
+    // Handle hand size reset logic for 3-card hands
+    if (playerMaxHandSize == 3 && selectedIndices.length == 1) {
+      playerMaxHandSize = 2;
+    }
+
     List<String> savedSelectedOps = List.from(selectedOps);
+    String? appliedModifier = activePlayerModifier; // FIXED: Store the modifier
 
-    setState(() {
-      if (field.isEmpty) {
-        // Final safety check inside setState with detailed logging
-        for (int i = 0; i < selectedIndices.length; i++) {
-          if (selectedIndices[i] < 0 ||
-              selectedIndices[i] >= playerHand.length) {
-            print(
-              'SETSTATE VALIDATION FAILED: selectedIndices[$i]=${selectedIndices[i]}, playerHand.length=${playerHand.length}',
-            );
-            clearSelections();
-            return;
-          }
-        }
+    // Validate the move BEFORE updating local state
+    bool isFirstPlay = field.isEmpty;
+    bool isValidMove = false;
 
-        // Store the actual cards to remove before any modifications
-        List<String> cardsToRemove = [];
-        List<int> validatedIndices = [];
+    if (!isFirstPlay) {
+      String prevFieldCard = field.isNotEmpty ? field.last : '2';
+      // FIXED: Pass the modifier to validation
+      isValidMove = isValidPlay(
+          playedCards, selectedOps, prevFieldCard, aceOverrides,
+          fieldAceValue: fieldAceValue, appliedModifier: appliedModifier);
+    }
 
-        // Double-validation: build list of cards to remove with bounds checking
-        for (int index in selectedIndices) {
-          if (index >= 0 && index < playerHand.length) {
-            cardsToRemove.add(playerHand[index]);
-            validatedIndices.add(index);
-          } else {
-            print(
-              'ERROR: Index $index is invalid for playerHand length ${playerHand.length}',
-            );
-            clearSelections();
-            return;
-          }
-        }
-
-        // Remove cards in descending order to maintain index validity
-        validatedIndices.sort((a, b) => b.compareTo(a));
-        for (int index in validatedIndices) {
-          if (index >= 0 && index < playerHand.length) {
-            playerHand.removeAt(index);
-          } else {
-            print(
-              'CRITICAL ERROR: Index became invalid during removal: $index',
-            );
-            break;
-          }
-        }
-
-        // Clear selections AFTER removing cards
-        clearSelections();
-
-        // Add cards to field in order (playedCards reordered by isValidPlay)
-        for (var card in playedCards) {
-          field.add(card);
-        }
-        // --- NEW: Track Ace value if last card is Ace ---
-        if (field.isNotEmpty && field.last == 'a') {
-          if (playedCards.isNotEmpty &&
-              playedCards.last == 'a' &&
-              aceOverrides.isNotEmpty) {
-            fieldAceValue = aceOverrides.last;
-          } else {
-            fieldAceValue = 14;
-          }
-        } else {
-          fieldAceValue = null;
-        }
-
-        // Add to activity log
-        List<String> localSelectedOps = List.from(savedSelectedOps);
-        String playDescription =
-            'You played ${playedCards.asMap().entries.map((entry) {
-              int i = entry.key;
-              String card = entry.value;
-              String cardNum = cardValue(card).toString().replaceAll('.0', '');
-              if (i == 0) return cardNum;
-              if (localSelectedOps.isEmpty || (i - 1) >= localSelectedOps.length || (i - 1) < 0) return ' $cardNum';
-              return ' ${localSelectedOps[i - 1]} $cardNum';
-            }).join('')}';
-
-        activityLog.add(playDescription);
-
-        playCardSound();
-        message = "Opponent's turn!";
-        isPlayerTurn = false;
-        safeDrawCards(playerHand, playerDrawPile, 2);
-        playerMaxHandSize = 2;
-        Future.delayed(const Duration(seconds: 1), opponentTurn);
+    // Remove cards from hand
+    List<int> validatedIndices = [];
+    for (int index in selectedIndices) {
+      if (index >= 0 && index < playerHand.length) {
+        validatedIndices.add(index);
       } else {
-        // Final safety check inside setState for non-empty field case
-        for (int i = 0; i < selectedIndices.length; i++) {
-          if (selectedIndices[i] < 0 ||
-              selectedIndices[i] >= playerHand.length) {
-            print(
-              'SETSTATE VALIDATION FAILED (non-empty field): selectedIndices[$i]=${selectedIndices[i]}, playerHand.length=${playerHand.length}',
-            );
-            clearSelections();
-            return;
-          }
-        }
+        print(
+            'ERROR: Index $index is invalid for playerHand length ${playerHand.length}');
+        clearSelections();
+        return;
+      }
+    }
 
-        String prevFieldCard;
-        if (field.isNotEmpty) {
-          prevFieldCard = field.last;
-        } else if (playedCards.isNotEmpty) {
-          prevFieldCard = playedCards.first;
+    validatedIndices.sort((a, b) => b.compareTo(a));
+    for (int index in validatedIndices) {
+      if (index >= 0 && index < playerHand.length) {
+        playerHand.removeAt(index);
+      }
+    }
+
+    clearSelections();
+
+    // Add cards to field with proper reordering
+    List<String> cardsToAdd = List.from(playedCards);
+    if (cardsToAdd.length > 1) {
+      List<double> values = [];
+      int aceIdx = 0;
+      for (int i = 0; i < cardsToAdd.length; i++) {
+        if (cardsToAdd[i] == 'a') {
+          int aceValue = 14;
+          if (aceIdx < aceOverrides.length) {
+            aceValue = aceOverrides[aceIdx];
+          }
+          values.add(cardValue('a', aceOverride: aceValue));
+          aceIdx++;
         } else {
-          prevFieldCard = '2'; // fallback to a valid card value
-        }
-        // --- NEW: Use fieldAceValue when calling isValidPlay ---
-        if (isValidPlay(
-          playedCards,
-          selectedOps,
-          prevFieldCard,
-          aceOverrides,
-          fieldAceValue: fieldAceValue,
-        )) {
-          // Store the actual cards to remove before any modifications
-          List<String> cardsToRemove = [];
-          List<int> validatedIndices = [];
-
-          // Double-validation: build list of cards to remove with bounds checking
-          for (int index in selectedIndices) {
-            if (index >= 0 && index < playerHand.length) {
-              cardsToRemove.add(playerHand[index]);
-              validatedIndices.add(index);
-            } else {
-              print(
-                'ERROR: Index $index is invalid for playerHand length ${playerHand.length} during valid play',
-              );
-              clearSelections();
-              return;
-            }
-          }
-
-          // Remove cards in descending order to maintain index validity
-          validatedIndices.sort((a, b) => b.compareTo(a));
-          for (int index in validatedIndices) {
-            if (index >= 0 && index < playerHand.length) {
-              playerHand.removeAt(index);
-            } else {
-              print(
-                'CRITICAL ERROR: Index became invalid during valid play removal: $index',
-              );
-              break;
-            }
-          }
-
-          // Clear selections AFTER removing cards
-          clearSelections();
-
-          // Add removed cards to field in reordered sequence (playedCards reordered by isValidPlay)
-          for (var card in playedCards) {
-            field.add(card);
-          }
-          // --- NEW: Track Ace value if last card is Ace ---
-          if (field.isNotEmpty && field.last == 'a') {
-            if (playedCards.isNotEmpty &&
-                playedCards.last == 'a' &&
-                aceOverrides.isNotEmpty) {
-              fieldAceValue = aceOverrides.last;
-            } else {
-              fieldAceValue = 14;
-            }
-          } else {
-            fieldAceValue = null;
-          }
-          // Add to activity log
-          List<String> localSelectedOps = List.from(savedSelectedOps);
-          int aceOverrideIdx = 0;
-          String playDescription =
-              'You played ${playedCards.asMap().entries.map((entry) {
-                print('DEBUG START: i: ${entry.key}, localSelectedOps: $localSelectedOps');
-                int i = entry.key;
-                String card = entry.value;
-                String cardNum;
-                if (card == 'a' && aceOverrides.isNotEmpty && aceOverrideIdx < aceOverrides.length) {
-                  cardNum = aceOverrides[aceOverrideIdx].toString();
-                  aceOverrideIdx++;
-                } else {
-                  cardNum = cardValue(card).toString().replaceAll('.0', '');
-                }
-                if (i == 0) return cardNum;
-                if (localSelectedOps.isEmpty || (i - 1) >= localSelectedOps.length || (i - 1) < 0) return ' $cardNum';
-                print('DEBUG: i: $i, localSelectedOps.length: ${localSelectedOps.length}, trying to access index: ${i - 1}');
-                print('DEBUG: localSelectedOps contents: $localSelectedOps');
-                return ' ${localSelectedOps[i - 1]} $cardNum';
-              }).join('')}';
-
-          activityLog.add(playDescription);
-
-          playCardSound();
-          if (playerPrizeCards.isNotEmpty) {
-            playerPrizeCards.removeLast();
-            print('Prize card won! Remaining: ${playerPrizeCards.length}');
-            message = "Great play!";
-            playPrizeCardSound(); // Add prize card sound here
-            checkForWin();
-            if (gameOver) return;
-          } else {
-            message = "Success! But no prize cards left.";
-          }
-          if (playedCards.length == 1) {
-            playerMaxHandSize = 3;
-          } else {
-            playerMaxHandSize = 2;
-          }
-        } else {
-          // Store the actual cards to remove before any modifications
-          List<String> cardsToRemove = [];
-          List<int> validatedIndices = [];
-
-          // Double-validation: build list of cards to remove with bounds checking
-          for (int index in selectedIndices) {
-            if (index >= 0 && index < playerHand.length) {
-              cardsToRemove.add(playerHand[index]);
-              validatedIndices.add(index);
-            } else {
-              print(
-                'ERROR: Index $index is invalid for playerHand length ${playerHand.length} during invalid play',
-              );
-              clearSelections();
-              return;
-            }
-          }
-
-          // Remove cards in descending order to maintain index validity
-          validatedIndices.sort((a, b) => b.compareTo(a));
-          for (int index in validatedIndices) {
-            if (index >= 0 && index < playerHand.length) {
-              playerHand.removeAt(index);
-            } else {
-              print(
-                'CRITICAL ERROR: Index became invalid during invalid play removal: $index',
-              );
-              break;
-            }
-          }
-
-          // Clear selections AFTER removing cards
-          clearSelections();
-
-          // Add removed cards to field in original order
-          for (var card in cardsToRemove) {
-            field.add(card);
-          }
-          // --- NEW: Track Ace value if last card is Ace ---
-          if (field.isNotEmpty && field.last == 'a') {
-            if (playedCards.isNotEmpty &&
-                playedCards.last == 'a' &&
-                aceOverrides.isNotEmpty) {
-              fieldAceValue = aceOverrides.last;
-            } else {
-              fieldAceValue = 14;
-            }
-          } else {
-            fieldAceValue = null;
-          }
-          // Add to activity log
-          List<String> localSelectedOps = List.from(savedSelectedOps);
-          String playDescription =
-              'You played ${playedCards.asMap().entries.map((entry) {
-                int i = entry.key;
-                String card = entry.value;
-                String cardNum = cardValue(card).toString().replaceAll('.0', '');
-                if (i == 0) return cardNum;
-                if (localSelectedOps.isEmpty || (i - 1) >= localSelectedOps.length || (i - 1) < 0) return ' $cardNum';
-                return ' ${localSelectedOps[i - 1]} $cardNum';
-              }).join('')}';
-
-          activityLog.add(playDescription);
-
-          playCardSound();
-          message = "No contest";
-          playerMaxHandSize = 2;
-        }
-        isPlayerTurn = false;
-        safeDrawCards(playerHand, playerDrawPile, 2);
-        if (!gameOver) {
-          Future.delayed(const Duration(seconds: 1), opponentTurn);
+          values.add(cardValue(cardsToAdd[i]));
         }
       }
+
+      double minValue = values.reduce(min);
+      int minIdx = values.indexOf(minValue);
+      if (minIdx != values.length - 1) {
+        String tempCard = cardsToAdd[minIdx];
+        cardsToAdd.removeAt(minIdx);
+        cardsToAdd.add(tempCard);
+      }
+    }
+
+    for (var card in cardsToAdd) {
+      field.add(card);
+    }
+
+    // Track ace values for rewind functionality
+    int aceIdx = 0;
+    for (int i = 0; i < cardsToAdd.length; i++) {
+      String card = cardsToAdd[i];
+      if (card == 'a' && i == cardsToAdd.length - 1) {
+        // Final ace gets the actual value used
+        int aceValue = aceIdx < aceOverrides.length ? aceOverrides[aceIdx] : 14;
+        fieldAceValueHistory.add(aceValue);
+        aceIdx++;
+      } else if (card == 'a') {
+        // Non-final ace
+        fieldAceValueHistory.add(null);
+        aceIdx++;
+      } else {
+        // Regular card
+        fieldAceValueHistory.add(null);
+      }
+    }
+
+    // Handle Ace value
+    if (field.isNotEmpty && field.last == 'a') {
+      if (cardsToAdd.isNotEmpty &&
+          cardsToAdd.last == 'a' &&
+          aceOverrides.isNotEmpty) {
+        fieldAceValue = aceOverrides.last;
+      } else {
+        fieldAceValue = 14;
+      }
+    } else {
+      fieldAceValue = null;
+    }
+
+    // Create play description with modifier info
+    String playDescription =
+        _createPlayDescription(playedCards, savedSelectedOps, aceOverrides);
+    if (appliedModifier != null) {
+      playDescription += ' ($appliedModifier)';
+      // Mark modifier as used
+      playerModifiers[appliedModifier] = true;
+    }
+
+    activityLog.add(playDescription);
+    playCardSound();
+
+// Handle scoring and special cases
+    if (isFirstPlay) {
+      activityLogColor = Colors.white;
+      safeDrawCards(playerHand, playerDrawPile, 2);
+    } else if (isValidMove) {
+      activityLogColor = Colors.greenAccent;
+      if (playerPrizeCards.isNotEmpty) {
+        HapticFeedback.mediumImpact();
+        playerPrizeCards.removeLast();
+        print('Point won! Remaining: ${playerPrizeCards.length}');
+        playPrizeCardSound();
+      }
+      safeDrawCards(playerHand, playerDrawPile, 2);
+      playerMaxHandSize = 2;
+    } else {
+      activityLogColor = Colors.white;
+      safeDrawCards(playerHand, playerDrawPile, 2);
+      playerMaxHandSize = 2;
+    }
+
+    safeDrawCards(playerHand, playerDrawPile, 2);
+
+    setState(() {
+      if (gameMode == 'human') {
+        message = "Sending move...";
+      } else {
+        isPlayerTurn = false;
+        message = "Opponent's turn!";
+      }
     });
+
+    // Update Firebase with modifier information
+    if (gameMode == 'human') {
+      this.playedCards = cardsToAdd;
+      selectedOps = savedSelectedOps;
+      this.appliedModifier = appliedModifier; // FIXED: Store applied modifier
+      await _updateFirebaseGameState();
+    } else if (!gameOver && gameMode == 'ai') {
+      Future.delayed(const Duration(seconds: 1), opponentTurn);
+    }
+
+    // Clear active modifier after use
+    if (appliedModifier != null) {
+      setState(() {
+        activePlayerModifier = null;
+      });
+    }
+
+    checkForWin();
   }
 
   void opponentTurn() async {
+    // FIXED: Only run opponent AI in single-player mode
+    if (gameMode != 'ai' || gameOver) return;
+
     if (gameOver) return;
     turnTimer?.cancel();
     setState(() {});
@@ -994,430 +3473,626 @@ class _GameScreenState extends State<GameScreen> {
     await Future.delayed(const Duration(seconds: 1));
     if (!mounted || gameOver) return;
 
-    // Enhanced AI: Always plays optimal moves and chooses the best one strategically
-    double winChance;
-    if (aiDifficulty == 1) {
-      winChance = 0.7; // Easy
-    } else if (aiDifficulty == 2) {
-      winChance = 0.9; // Medium
-    } else {
-      winChance = 1.0; // Hard
+    // CRITICAL FIX: Add recursion prevention using class variable
+    if (_isOpponentTurnRunning) {
+      print('WARNING: Opponent turn already running, preventing infinite loop');
+      return;
     }
-    bool tryToWin = Random().nextDouble() < winChance;
+    _isOpponentTurnRunning = true;
 
-    // Strategic AI: Find ALL valid plays and choose the best one
-    List<Map<String, dynamic>> allValidPlays = [];
+    try {
+      // SAFETY: Validate opponent has cards
+      if (opponentActualHand.isEmpty) {
+        print('SAFETY: Opponent has no cards, ending turn');
+        setState(() {
+          message = "Opponent has no cards left!";
+          isPlayerTurn = true;
+        });
+        startTimer();
+        return;
+      }
 
-    // Helper to generate all possible combinations
-    List<List<int>> getCombinations(int n, int k) {
-      List<List<int>> result = [];
-      void combine(List<int> curr, int start) {
-        if (curr.length == k) {
-          result.add(List.from(curr));
-          return;
-        }
-        for (int i = start; i < n; i++) {
-          curr.add(i);
-          combine(curr, i + 1);
-          curr.removeLast();
+      // BULLETPROOF AI LOGIC STARTS HERE
+      print('=== AI TURN START ===');
+      print('AI Hand: $opponentActualHand');
+      print('Field: $field');
+      print('Field Ace Value: $fieldAceValue');
+
+      // Simple difficulty-based win chance
+      double winChance;
+      if (aiDifficulty == 1) {
+        winChance = 0.67; // Easy should still be beatable
+      } else if (aiDifficulty == 2) {
+        winChance = 0.70; // Medium should be challenging but fair
+      } else {
+        // Hard difficulty scales with win streak but starts lower
+        winChance = (0.82 + (winStreak * 0.02)).clamp(0.82, 1.0);
+      }
+      bool shouldTryToWin = Random().nextDouble() < winChance;
+
+      // AI MODIFIER LOGIC - Handle special modifiers before card selection
+      String? aiModifierToUse;
+
+      // Get available modifiers for AI (but skip if difficulty is 1)
+      List<String> availableModifiers = [];
+      if (aiDifficulty > 1) {
+        // Only use modifiers on Medium (2) and Hard (3) difficulty
+        for (String key in opponentModifiers.keys) {
+          if (!opponentModifiers[key]!) {
+            availableModifiers.add(key);
+          }
         }
       }
 
-      combine([], 0);
-      return result;
-    }
+      if (availableModifiers.isNotEmpty) {
+// -0.5 logic - use when AI needs a slight adjustment to hit target
+        if (availableModifiers.contains('-0.5') && field.isNotEmpty) {}
 
-    // Try all single-card plays
-    if (field.isNotEmpty) {
-      for (int i = 0; i < opponentHand.length; i++) {
-        String card = opponentHand[i];
-        List<int> aceOverrides = [];
-        String prevFieldCard = field.isNotEmpty ? field.last : card;
-        if (card == 'a') {
-          // Try both ace values
-          for (int aceVal in [1, 14]) {
-            aceOverrides = [aceVal];
-            if (isValidPlay(
-              [card],
-              [],
-              prevFieldCard,
-              aceOverrides,
-              fieldAceValue: fieldAceValue,
-            )) {
-              allValidPlays.add({
+        // Rewind logic - use when field target is bad for AI
+        if (availableModifiers.contains('rewind') && field.length > 1) {
+          double fieldValue = field.last == 'a' && fieldAceValue != null
+              ? fieldAceValue!.toDouble()
+              : cardValue(field.last);
+          // Use rewind if current target is hard to match
+          if ([1, 13, 14].contains(fieldValue.toInt()) &&
+              Random().nextDouble() < 0.3) {
+            setState(() {
+              field.removeLast();
+
+              // Remove the corresponding ace value from history
+              if (fieldAceValueHistory.isNotEmpty) {
+                fieldAceValueHistory.removeLast();
+              }
+
+              // Restore proper ace value if the new last card is an ace
+              if (field.isNotEmpty && field.last == 'a') {
+                if (fieldAceValueHistory.isNotEmpty) {
+                  fieldAceValue = fieldAceValueHistory.last;
+                } else {
+                  fieldAceValue = null;
+                }
+              } else {
+                fieldAceValue = null;
+              }
+
+              opponentModifiers['rewind'] = true;
+              activityLog.add('Opponent rewound the field!');
+              activityLogColor = Colors.orange;
+            });
+            print('AI used Rewind modifier');
+          }
+        }
+
+        // Draw1 logic - use when AI has a poor hand
+        if (availableModifiers.contains('draw1') &&
+            opponentActualHand.length < 3) {
+          // Count high-value cards (harder to play strategically)
+          int highCards = 0;
+          for (String card in opponentActualHand) {
+            double val = cardValue(card);
+            if (val >= 10) highCards++;
+          }
+          // Use draw1 if mostly high cards
+          if (highCards >= opponentActualHand.length * 0.6 &&
+              Random().nextDouble() < 0.4) {
+            setState(() {
+              if (opponentActualDrawPile.isNotEmpty) {
+                opponentActualHand.add(opponentActualDrawPile.removeAt(0));
+                opponentHand.add('cardback');
+              }
+              opponentModifiers['draw1'] = true;
+              activityLog.add('Opponent drew an extra card!');
+              activityLogColor = Colors.orange;
+            });
+            print('AI used Draw1 modifier');
+          }
+        }
+
+        // Select calculation modifier for this play
+        List<String> calcModifiers = availableModifiers
+            .where((m) =>
+                ['2x', '+3', '-3', '-1', '+1', '+11', '-0.5'].contains(m))
+            .toList();
+
+        if (calcModifiers.isNotEmpty &&
+            shouldTryToWin &&
+            Random().nextDouble() < 0.3) {
+          aiModifierToUse =
+              calcModifiers[Random().nextInt(calcModifiers.length)];
+          print('AI selected modifier: $aiModifierToUse');
+        }
+      }
+
+      List<Map<String, dynamic>> validPlays = [];
+
+      // STEP 1: Find ALL genuinely valid single-card plays (INCLUDING MODIFIER EFFECTS)
+      for (int i = 0; i < opponentActualHand.length; i++) {
+        String card = opponentActualHand[i];
+
+        if (field.isEmpty) {
+          // First play - any card is valid
+          validPlays.add({
+            'indices': [i],
+            'cards': [card],
+            'ops': [],
+            'aceOverrides': card == 'a' ? [14] : [],
+            'isValid': true,
+            'score': 1.0,
+            'modifier': null, // No modifiers on first play
+          });
+        } else {
+          // Need to match field card
+          String fieldCard = field.last;
+          double targetValue = fieldCard == 'a' && fieldAceValue != null
+              ? fieldAceValue!.toDouble()
+              : cardValue(fieldCard);
+
+          if (card == 'a') {
+            // Try ace as both 1 and 14
+            for (int aceVal in [1, 14]) {
+              double playValue = aceVal.toDouble();
+
+              // Try without modifier first
+              if (playValue == targetValue * 2 ||
+                  playValue == targetValue / 2) {
+                validPlays.add({
+                  'indices': [i],
+                  'cards': [card],
+                  'ops': [],
+                  'aceOverrides': [aceVal],
+                  'isValid': true,
+                  'score': 3.0,
+                  'modifier': null,
+                });
+              }
+
+              // Try with modifier if available
+              if (aiModifierToUse != null) {
+                double modifiedValue =
+                    _applyModifierToValue(playValue, aiModifierToUse);
+                if (modifiedValue == targetValue * 2 ||
+                    modifiedValue == targetValue / 2) {
+                  validPlays.add({
+                    'indices': [i],
+                    'cards': [card],
+                    'ops': [],
+                    'aceOverrides': [aceVal],
+                    'isValid': true,
+                    'score': 4.0, // Higher score for modifier plays
+                    'modifier': aiModifierToUse,
+                  });
+                }
+              }
+            }
+          } else {
+            // Regular card
+            double playValue = cardValue(card);
+
+            // Try without modifier
+            if (playValue == targetValue * 2 || playValue == targetValue / 2) {
+              validPlays.add({
+                'indices': [i],
                 'cards': [card],
                 'ops': [],
-                'aceOverrides': [aceVal],
-                'score': 3, // Single card plays get priority
+                'aceOverrides': [],
+                'isValid': true,
+                'score': 3.0,
+                'modifier': null,
               });
             }
-          }
-        } else {
-          if (isValidPlay(
-            [card],
-            [],
-            prevFieldCard,
-            [],
-            fieldAceValue: fieldAceValue,
-          )) {
-            allValidPlays.add({
-              'cards': [card],
-              'ops': [],
-              'aceOverrides': [],
-              'score': 3, // Single card plays get priority
-            });
-          }
-        }
-      }
-    }
 
-    // Try all double-card plays
-    if (field.isNotEmpty && opponentHand.length >= 2) {
-      for (var combo in getCombinations(opponentHand.length, 2)) {
-        // --- Range check to prevent out-of-bounds errors ---
-        if (combo[0] >= opponentHand.length ||
-            combo[1] >= opponentHand.length) {
-          continue;
-        }
-        List<String> cards = [opponentHand[combo[0]], opponentHand[combo[1]]];
-        for (var op in ['+', '-']) {
-          List<List<int>> aceValueCombos = [[]];
-          if (cards[0] == 'a' && cards[1] == 'a') {
-            aceValueCombos = [
-              [1, 1],
-              [1, 14],
-              [14, 1],
-              [14, 14],
-            ];
-          } else if (cards[0] == 'a') {
-            aceValueCombos = [
-              [1],
-              [14],
-            ];
-          } else if (cards[1] == 'a') {
-            aceValueCombos = [
-              [1],
-              [14],
-            ];
-          }
-          for (var aceOverrides in aceValueCombos) {
-            String prevFieldCard = field.isNotEmpty ? field.last : cards.first;
-            if (isValidPlay(
-              cards,
-              [op],
-              prevFieldCard,
-              aceOverrides,
-              fieldAceValue: fieldAceValue,
-            )) {
-              allValidPlays.add({
-                'cards': List.from(cards),
-                'ops': [op],
-                'aceOverrides': List.from(aceOverrides),
-                'score':
-                    2, // Double plays are good but less priority than singles
-              });
-            }
-          }
-        }
-      }
-    }
-
-    // Try all triple-card plays
-    if (field.isNotEmpty && opponentHand.length >= 3) {
-      for (var combo in getCombinations(opponentHand.length, 3)) {
-        if (combo[0] >= opponentHand.length ||
-            combo[1] >= opponentHand.length ||
-            combo[2] >= opponentHand.length) {
-          continue;
-        }
-        List<String> cards = [
-          opponentHand[combo[0]],
-          opponentHand[combo[1]],
-          opponentHand[combo[2]],
-        ];
-        for (var op1 in ['+', '-']) {
-          for (var op2 in ['+', '-']) {
-            List<List<int>> aceValueCombos = [[]];
-            int aceCount = cards.where((c) => c == 'a').length;
-            if (aceCount == 3) {
-              aceValueCombos = [
-                [1, 1, 1],
-                [1, 1, 14],
-                [1, 14, 1],
-                [1, 14, 14],
-                [14, 1, 1],
-                [14, 1, 14],
-                [14, 14, 1],
-                [14, 14, 14],
-              ];
-            } else if (aceCount == 2) {
-              aceValueCombos = [
-                [1, 1],
-                [1, 14],
-                [14, 1],
-                [14, 14],
-              ];
-            } else if (aceCount == 1) {
-              aceValueCombos = [
-                [1],
-                [14],
-              ];
-            }
-            for (var aceOverrides in aceValueCombos) {
-              String prevFieldCard = field.isNotEmpty
-                  ? field.last
-                  : cards.first;
-              if (isValidPlay(
-                cards,
-                [op1, op2],
-                prevFieldCard,
-                aceOverrides,
-                fieldAceValue: fieldAceValue,
-              )) {
-                allValidPlays.add({
-                  'cards': List.from(cards),
-                  'ops': [op1, op2],
-                  'aceOverrides': List.from(aceOverrides),
-                  'score': 1, // Triple plays are least priority
+            // Try with modifier
+            if (aiModifierToUse != null) {
+              double modifiedValue =
+                  _applyModifierToValue(playValue, aiModifierToUse);
+              if (modifiedValue == targetValue * 2 ||
+                  modifiedValue == targetValue / 2) {
+                validPlays.add({
+                  'indices': [i],
+                  'cards': [card],
+                  'ops': [],
+                  'aceOverrides': [],
+                  'isValid': true,
+                  'score': 4.0,
+                  'modifier': aiModifierToUse,
                 });
               }
             }
           }
         }
       }
-    }
 
-    // Choose the best play (highest score = single card preferred)
-    List<String> bestPlay = [];
-    List<String> bestOps = [];
-    List<int> bestAceOverrides = [];
+      // STEP 2: Find valid two-card combinations (including modifier effects)
+      if (opponentActualHand.length >= 2 && field.isNotEmpty) {
+        String fieldCard = field.last;
+        double targetValue = fieldCard == 'a' && fieldAceValue != null
+            ? fieldAceValue!.toDouble()
+            : cardValue(fieldCard);
 
-    if (allValidPlays.isNotEmpty) {
-      // Sort by score (descending) to prioritize single-card plays
-      allValidPlays.sort((a, b) => b['score'].compareTo(a['score']));
-      var chosenPlay = allValidPlays.first;
-      bestPlay = List<String>.from(chosenPlay['cards']);
-      bestOps = List<String>.from(chosenPlay['ops']);
-      bestAceOverrides = List<int>.from(chosenPlay['aceOverrides']);
-    }
+        for (int i = 0; i < opponentActualHand.length; i++) {
+          for (int j = i + 1; j < opponentActualHand.length; j++) {
+            String card1 = opponentActualHand[i];
+            String card2 = opponentActualHand[j];
 
-    // Decide whether to play a valid move or random
-    bool playValid = bestPlay.isNotEmpty && tryToWin;
+            // Try both operations
+            for (String op in ['+', '-']) {
+              // Handle ace values
+              double val1 = cardValue(card1);
+              double val2 = cardValue(card2);
 
-    setState(() {
-      if (opponentHand.isEmpty) {
-        message = "Opponent has no cards left!";
-        isPlayerTurn = true;
-        startTimer();
-        return;
-      }
+              if (card1 == 'a') {
+                for (int aceVal in [1, 14]) {
+                  val1 = aceVal.toDouble();
+                  if (card2 == 'a') {
+                    for (int aceVal2 in [1, 14]) {
+                      val2 = aceVal2.toDouble();
+                      double result = op == '+' ? val1 + val2 : val1 - val2;
 
-      List<int> indicesToPlay = [];
-      List<String> opsToPlay = [];
-      List<int> aceOverrides = [];
+                      // Try without modifier
+                      if (result == targetValue * 2 ||
+                          result == targetValue / 2) {
+                        validPlays.add({
+                          'indices': [i, j],
+                          'cards': [card1, card2],
+                          'ops': [op],
+                          'aceOverrides': [aceVal, aceVal2],
+                          'isValid': true,
+                          'score': 2.0,
+                          'modifier': null,
+                        });
+                      }
 
-      if (playValid) {
-        // Find indices in hand for bestPlay (in order)
-        List<String> handCopy = List.from(opponentHand);
-        for (var card in bestPlay) {
-          int idx = handCopy.indexOf(card);
-          if (idx != -1) {
-            indicesToPlay.add(idx);
-            handCopy[idx] = ''; // Mark as used
-          }
-        }
-        opsToPlay = bestOps;
-        aceOverrides = bestAceOverrides;
-      } else {
-        // Play a random card - but validate the hand first
-        if (opponentHand.isNotEmpty) {
-          indicesToPlay = [0];
-        } else {
-          message = "Opponent has no cards to play!";
-          isPlayerTurn = true;
-          startTimer();
-          return;
-        }
-        opsToPlay = [];
-        aceOverrides = [];
-      }
+                      // Try with modifier
+                      if (aiModifierToUse != null) {
+                        double modifiedResult =
+                            _applyModifierToValue(result, aiModifierToUse);
+                        if (modifiedResult == targetValue * 2 ||
+                            modifiedResult == targetValue / 2) {
+                          validPlays.add({
+                            'indices': [i, j],
+                            'cards': [card1, card2],
+                            'ops': [op],
+                            'aceOverrides': [aceVal, aceVal2],
+                            'isValid': true,
+                            'score': 3.0, // Higher score for modifier plays
+                            'modifier': aiModifierToUse,
+                          });
+                        }
+                      }
+                    }
+                  } else {
+                    double result = op == '+' ? val1 + val2 : val1 - val2;
 
-      // CRITICAL FIX: Validate indices BEFORE attempting to remove cards
-      bool indicesValid = indicesToPlay.every(
-        (i) => i >= 0 && i < opponentHand.length,
-      );
+                    if (result == targetValue * 2 ||
+                        result == targetValue / 2) {
+                      validPlays.add({
+                        'indices': [i, j],
+                        'cards': [card1, card2],
+                        'ops': [op],
+                        'aceOverrides': [aceVal],
+                        'isValid': true,
+                        'score': 2.0,
+                        'modifier': null,
+                      });
+                    }
 
-      if (!indicesValid) {
-        print(
-          'Invalid opponent indices detected: $indicesToPlay for hand length ${opponentHand.length}',
-        );
-        // Fallback to playing the first available card safely
-        if (opponentHand.isNotEmpty) {
-          indicesToPlay = [0];
-          opsToPlay = [];
-          aceOverrides = [];
-        } else {
-          message = "Opponent has no valid cards to play!";
-          isPlayerTurn = true;
-          startTimer();
-          return;
-        }
-      }
+                    if (aiModifierToUse != null) {
+                      double modifiedResult =
+                          _applyModifierToValue(result, aiModifierToUse);
+                      if (modifiedResult == targetValue * 2 ||
+                          modifiedResult == targetValue / 2) {
+                        validPlays.add({
+                          'indices': [i, j],
+                          'cards': [card1, card2],
+                          'ops': [op],
+                          'aceOverrides': [aceVal],
+                          'isValid': true,
+                          'score': 3.0,
+                          'modifier': aiModifierToUse,
+                        });
+                      }
+                    }
+                  }
+                }
+              } else if (card2 == 'a') {
+                for (int aceVal in [1, 14]) {
+                  val2 = aceVal.toDouble();
+                  double result = op == '+' ? val1 + val2 : val1 - val2;
 
-      // Remove and play cards in reverse order so indices remain valid
-      List<String> playedCards = [];
-      indicesToPlay.sort();
-      for (int i = indicesToPlay.length - 1; i >= 0; i--) {
-        if (indicesToPlay[i] >= 0 && indicesToPlay[i] < opponentHand.length) {
-          playedCards.insert(0, opponentHand.removeAt(indicesToPlay[i]));
-        } else {
-          print(
-            'ERROR: Attempted to remove invalid index ${indicesToPlay[i]} from opponent hand of length ${opponentHand.length}',
-          );
-          // Skip this invalid index
-          continue;
-        }
-      }
+                  if (result == targetValue * 2 || result == targetValue / 2) {
+                    validPlays.add({
+                      'indices': [i, j],
+                      'cards': [card1, card2],
+                      'ops': [op],
+                      'aceOverrides': [aceVal],
+                      'isValid': true,
+                      'score': 2.0,
+                      'modifier': null,
+                    });
+                  }
 
-      // If no cards were successfully removed, fallback
-      if (playedCards.isEmpty && opponentHand.isNotEmpty) {
-        print('No cards removed successfully, playing first card as fallback');
-        playedCards = [opponentHand.removeAt(0)];
-        opsToPlay = [];
-        aceOverrides = [];
-      }
+                  if (aiModifierToUse != null) {
+                    double modifiedResult =
+                        _applyModifierToValue(result, aiModifierToUse);
+                    if (modifiedResult == targetValue * 2 ||
+                        modifiedResult == targetValue / 2) {
+                      validPlays.add({
+                        'indices': [i, j],
+                        'cards': [card1, card2],
+                        'ops': [op],
+                        'aceOverrides': [aceVal],
+                        'isValid': true,
+                        'score': 3.0,
+                        'modifier': aiModifierToUse,
+                      });
+                    }
+                  }
+                }
+              } else {
+                // No aces
+                double result = op == '+' ? val1 + val2 : val1 - val2;
 
-      // Store the previous field card before adding new cards
-      String prevFieldCard = field.isNotEmpty
-          ? field.last
-          : (playedCards.isNotEmpty ? playedCards.first : '2'); // fallback
+                if (result == targetValue * 2 || result == targetValue / 2) {
+                  validPlays.add({
+                    'indices': [i, j],
+                    'cards': [card1, card2],
+                    'ops': [op],
+                    'aceOverrides': [],
+                    'isValid': true,
+                    'score': 2.0,
+                    'modifier': null,
+                  });
+                }
 
-      // Add to field in order, lowest value last
-      if (playedCards.isNotEmpty) {
-        List<double> values = [];
-        int aceIdx = 0;
-        for (int i = 0; i < playedCards.length; i++) {
-          if (playedCards[i] == 'a') {
-            if (aceIdx < aceOverrides.length) {
-              values.add(cardValue('a', aceOverride: aceOverrides[aceIdx]));
-            } else {
-              values.add(14);
+                if (aiModifierToUse != null) {
+                  double modifiedResult =
+                      _applyModifierToValue(result, aiModifierToUse);
+                  if (modifiedResult == targetValue * 2 ||
+                      modifiedResult == targetValue / 2) {
+                    validPlays.add({
+                      'indices': [i, j],
+                      'cards': [card1, card2],
+                      'ops': [op],
+                      'aceOverrides': [],
+                      'isValid': true,
+                      'score': 3.0,
+                      'modifier': aiModifierToUse,
+                    });
+                  }
+                }
+              }
             }
-            aceIdx++;
-          } else {
-            values.add(cardValue(playedCards[i]));
           }
         }
-        // Find index of lowest value
-        int minIdx = values.indexOf(values.reduce(min));
-        // Move lowest value card to last position
-        if (minIdx != values.length - 1) {
-          String tempCard = playedCards[minIdx];
-          playedCards.removeAt(minIdx);
-          playedCards.add(tempCard);
+      }
+
+      print('Found ${validPlays.length} valid plays');
+
+      // STEP 3: Choose the best play
+      Map<String, dynamic>? chosenPlay;
+
+      if (validPlays.isNotEmpty && shouldTryToWin) {
+        // Sort by score (higher is better)
+        validPlays.sort((a, b) => b['score'].compareTo(a['score']));
+        chosenPlay = validPlays.first;
+        print(
+            'AI chose strategic play: ${chosenPlay['cards']} with modifier: ${chosenPlay['modifier']}');
+      } else if (validPlays.isNotEmpty && !shouldTryToWin) {
+        // Sometimes play suboptimally on purpose
+        chosenPlay = validPlays[Random().nextInt(validPlays.length)];
+        print(
+            'AI chose random valid play: ${chosenPlay['cards']} with modifier: ${chosenPlay['modifier']}');
+      } else {
+        // FALLBACK: Play first card (this should rarely happen)
+        chosenPlay = {
+          'indices': [0],
+          'cards': [opponentActualHand[0]],
+          'ops': [],
+          'aceOverrides': opponentActualHand[0] == 'a' ? [14] : [],
+          'isValid': false, // Mark as fallback
+          'score': 0.0,
+          'modifier': null,
+        };
+        print('AI using fallback: ${chosenPlay['cards']}');
+      }
+
+      // STEP 4: Execute the chosen play
+      List<int> indicesToPlay = List<int>.from(chosenPlay['indices']);
+      List<String> cardsToPlay = List<String>.from(chosenPlay['cards']);
+      List<String> opsToPlay = List<String>.from(chosenPlay['ops']);
+      List<int> aceOverrides = List<int>.from(chosenPlay['aceOverrides']);
+      bool isValidPlay = chosenPlay['isValid'];
+      String? usedModifier = chosenPlay['modifier'];
+
+      // Mark modifier as used if AI used one
+      if (usedModifier != null) {
+        opponentModifiers[usedModifier] = true;
+      }
+
+      // Remove cards from AI hand (in reverse order to maintain indices)
+      indicesToPlay.sort((a, b) => b.compareTo(a));
+      for (int index in indicesToPlay) {
+        if (index >= 0 && index < opponentActualHand.length) {
+          opponentActualHand.removeAt(index);
         }
-        for (var card in playedCards) {
-          field.add(card);
+      }
+
+      // Update display hand
+      for (int i = 0; i < cardsToPlay.length && opponentHand.isNotEmpty; i++) {
+        opponentHand.removeAt(0);
+      }
+
+      setState(() {
+        // Add cards to field (with proper reordering if multi-card)
+        if (cardsToPlay.length > 1) {
+          // Reorder so largest value goes first (game rule: highest value first)
+          List<double> values = [];
+          for (int i = 0; i < cardsToPlay.length; i++) {
+            String card = cardsToPlay[i];
+            if (card == 'a' && i < aceOverrides.length) {
+              values.add(aceOverrides[i].toDouble());
+            } else {
+              values.add(cardValue(card));
+            }
+          }
+
+          int maxIndex = 0;
+          double maxValue = values[0];
+          for (int i = 1; i < values.length; i++) {
+            if (values[i] > maxValue) {
+              maxValue = values[i];
+              maxIndex = i;
+            }
+          }
+
+          // Move largest to front if it's not already there
+          if (maxIndex != 0) {
+            String tempCard = cardsToPlay[maxIndex];
+            cardsToPlay.removeAt(maxIndex);
+            cardsToPlay.insert(0, tempCard);
+
+            if (aceOverrides.length > maxIndex) {
+              int tempAce = aceOverrides[maxIndex];
+              aceOverrides.removeAt(maxIndex);
+              aceOverrides.insert(0, tempAce);
+            }
+          }
         }
-        // --- NEW: Track Ace value if last card is Ace ---
+
+        // Add to field
+        field.addAll(cardsToPlay);
+
+        // Set ace value if needed
         if (field.isNotEmpty && field.last == 'a') {
-          if (playedCards.isNotEmpty &&
-              playedCards.last == 'a' &&
-              aceOverrides.isNotEmpty) {
-            fieldAceValue = aceOverrides.last;
-          } else {
-            fieldAceValue = 14;
-          }
+          fieldAceValue = aceOverrides.isNotEmpty ? aceOverrides.last : 14;
         } else {
           fieldAceValue = null;
         }
+
+        // Create activity log message
+        String playDescription = 'Opp played ';
+        for (int i = 0; i < cardsToPlay.length; i++) {
+          String card = cardsToPlay[i];
+          String cardDisplay;
+
+          if (card == 'a' && i < aceOverrides.length) {
+            cardDisplay = aceOverrides[i].toString();
+          } else {
+            cardDisplay = cardValue(card).toString().replaceAll('.0', '');
+          }
+
+          if (i == 0) {
+            playDescription += cardDisplay;
+          } else {
+            String op = (i - 1) < opsToPlay.length ? opsToPlay[i - 1] : '+';
+            playDescription += ' $op $cardDisplay';
+          }
+        }
+
+        if (usedModifier != null) {
+          playDescription += ' ($usedModifier)';
+        }
+
+        activityLog.add(playDescription);
         playCardSound();
 
-        // Use opsToPlay instead of selectedOps for opponent
-        List<String> localSelectedOps = List.from(opsToPlay);
-        int aceOverrideIdx = 0;
-        String playDescription =
-            'Opponent played ${playedCards.asMap().entries.map((entry) {
-              int i = entry.key;
-              String card = entry.value;
-              String cardNum;
-              if (card == 'a' && aceOverrides.isNotEmpty && aceOverrideIdx < aceOverrides.length) {
-                cardNum = aceOverrides[aceOverrideIdx].toString();
-                aceOverrideIdx++;
-              } else {
-                cardNum = cardValue(card).toString().replaceAll('.0', '');
-              }
-              if (i == 0) return cardNum;
-              if (localSelectedOps.isEmpty || (i - 1) >= localSelectedOps.length || (i - 1) < 0) return ' $cardNum';
-              return ' ${localSelectedOps[i - 1]} $cardNum';
-            }).join('')}';
-        activityLog.add(playDescription);
+        // Handle scoring
+        bool isFirstPlay = field.length == cardsToPlay.length;
 
-        int prevIndex = field.length - playedCards.length - 1;
-        if (prevIndex >= 0 && prevIndex < field.length) {
-          prevFieldCard = field[prevIndex];
-        } else if (field.isNotEmpty) {
-          prevFieldCard = field.last;
-        } else if (playedCards.isNotEmpty) {
-          prevFieldCard = playedCards.first;
-        } else {
-          prevFieldCard = '2'; // fallback
-        }
-        // Use prevFieldCard for the valid play check
-        if (playValid &&
-            isValidPlay(
-              playedCards,
-              opsToPlay,
-              prevFieldCard,
-              aceOverrides,
-              fieldAceValue: fieldAceValue,
-            )) {
+        if (isFirstPlay) {
+          // First play - no prize
+          activityLogColor = Colors.white;
+        } else if (isValidPlay) {
+          // Valid strategic play - AI gets prize card
+          activityLogColor = Colors.redAccent;
           if (opponentPrizeCards.isNotEmpty) {
             opponentPrizeCards.removeLast();
-            message = "Yikes!";
-            playPrizeCardSound(); // Add prize card sound here too
-            checkForWin();
-            if (gameOver) return;
-          } else {
-            message = "Opponent succeeded, but no prize cards left.";
+            playPrizeCardSound();
           }
         } else {
-          message = "Opponent played, your turn!";
+          // Invalid play - no prize
+          activityLogColor = Colors.white;
         }
-      } else {
-        message = "Opponent couldn't play, your turn!";
-      }
 
-      isPlayerTurn = true;
-      safeDrawCards(opponentHand, opponentDrawPile, 2);
+        // Replenish AI hand
+        while (opponentActualHand.length < 2 &&
+            opponentActualDrawPile.isNotEmpty) {
+          opponentActualHand.add(opponentActualDrawPile.removeAt(0));
+        }
+        while (opponentHand.length < 2) {
+          opponentHand.add('cardback');
+        }
+
+        // Check win condition
+        checkForWin();
+        if (gameOver) return;
+
+        // End turn
+        isPlayerTurn = true;
+        message = "Your turn!";
+      });
+
       startTimer();
-    });
+      print('=== AI TURN END ===');
+    } catch (e) {
+      print('ERROR in opponentTurn: $e');
+      if (mounted) {
+        setState(() {
+          isPlayerTurn = true;
+          message = "Your turn!";
+        });
+        startTimer();
+      }
+    } finally {
+      _isOpponentTurnRunning = false;
+    }
+  }
+
+// Helper method to apply modifiers to calculated values
+  double _applyModifierToValue(double value, String modifier) {
+    switch (modifier) {
+      case '2x':
+        return value * 2;
+      case '+3':
+        return value + 3;
+      case '-3':
+        return value - 3;
+      case '-1':
+        return value - 1;
+      case '+1':
+        return value + 1;
+      case '+11':
+        return value + 11;
+      case '-0.5': // ADD THIS CASE
+        return value - 0.5;
+      default:
+        return value;
+    }
   }
 
   void toggleCardSelection(int index) {
     if (index < 0 || index >= playerHand.length) {
       print(
-        'Invalid card selection index: $index (hand length: ${playerHand.length})',
-      );
+          'Invalid card selection index: $index (hand length: ${playerHand.length})');
       return;
     }
 
+    // Play tap sound for both selection and deselection
+    playTapSound();
+
+    HapticFeedback.lightImpact();
     setState(() {
       if (selectedIndices.contains(index)) {
-        // Remove card
         selectedIndices.remove(index);
 
-        // Rebuild selectedOps to match new length exactly
         selectedOps.clear();
         for (int i = 0; i < selectedIndices.length - 1; i++) {
           selectedOps.add('+');
         }
       } else {
-        // Add card if under limit
         if (selectedIndices.length < 3) {
           selectedIndices.add(index);
 
-          // Rebuild selectedOps to match new length exactly
           selectedOps.clear();
           for (int i = 0; i < selectedIndices.length - 1; i++) {
             selectedOps.add('+');
@@ -1438,24 +4113,287 @@ class _GameScreenState extends State<GameScreen> {
   void toggleOperation(int opIndex) {
     if (opIndex < 0 || opIndex >= selectedOps.length) {
       print(
-        'Invalid operation index: $opIndex (selectedOps length: ${selectedOps.length})',
-      );
+          'Invalid operation index: $opIndex (selectedOps length: ${selectedOps.length})');
       return;
     }
 
+    playTapSound();
+
+    HapticFeedback.selectionClick();
     setState(() {
       selectedOps[opIndex] = selectedOps[opIndex] == '+' ? '-' : '+';
     });
   }
 
-  Widget buildTimer({required bool isMobile, required bool isTablet}) {
-    final timerSize = isMobile ? 60.0 : (isTablet ? 75.0 : 90.0);
+  Widget buildTimer({required bool isMobile, required bool isTablet, bool isSmallPhone = false, bool isShortScreen = false}) {
+    final timerSize = isSmallPhone 
+        ? 50.0 
+        : (isShortScreen ? 55.0 : (isMobile ? 60.0 : (isTablet ? 75.0 : 90.0)));
     return Padding(
-      padding: EdgeInsets.only(left: isMobile ? 12 : 24),
+      padding: EdgeInsets.only(left: isSmallPhone ? 8 : (isMobile ? 12 : 24)),
       child: SizedBox(
         width: timerSize,
         height: timerSize,
-        child: AnalogPaperTimer(secondsLeft: timerSeconds, totalSeconds: 10),
+        child: AnalogPaperTimer(secondsLeft: timerSeconds, totalSeconds: 10, size: timerSize),
+      ),
+    );
+  }
+
+  Widget buildModifierCards({required bool isMobile, bool isSmallPhone = false}) {
+    if (gameOver || showInitialOverlay) return const SizedBox.shrink();
+
+    if (playerAvailableModifiers.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        for (int i = 0; i < playerAvailableModifiers.length && i < 3; i++) ...[
+          if (i > 0) SizedBox(width: isSmallPhone ? 6 : (isMobile ? 8 : 12)),
+          AnimatedModifierCard(
+            modifierType: playerAvailableModifiers[i],
+            tooltip: _getModifierTooltip(playerAvailableModifiers[i]),
+            used: playerModifiers[playerAvailableModifiers[i]] ?? false,
+            onTap: isPlayerTurn
+                ? () => _useModifier(playerAvailableModifiers[i])
+                : null,
+            isMobile: isMobile,
+            isSmallPhone: isSmallPhone,
+            isSelected: activePlayerModifier == playerAvailableModifiers[i],
+          ),
+        ],
+      ],
+    );
+  }
+
+// Add these helper methods to get modifier symbols and tooltips
+  String _getModifierSymbol(String modifier) {
+    switch (modifier) {
+      case 'mulligan':
+        return 'M';
+      case '2x':
+        return '2×';
+      case '+3':
+        return '+3';
+      case '-3':
+        return '-3';
+      case '+1':
+        return '+1';
+      case '-1':
+        return '-1';
+      case '+11':
+        return '+11';
+      case 'draw1':
+        return 'D';
+      case '-0.5':
+        return '-½';
+      case 'rewind':
+        return 'R';
+      default:
+        return '?';
+    }
+  }
+
+  String _getModifierTooltip(String modifier) {
+    switch (modifier) {
+      case 'mulligan':
+        return 'Mulligan\n(Reshuffle Hand)';
+      case '2x':
+        return 'Double Result';
+      case '+3':
+        return 'Add 3 to Result';
+      case '-3':
+        return 'Subtract 3 from Result';
+      case '+1':
+        return 'Add 1 to Result';
+      case '-1':
+        return 'Subtract 1 from Result';
+      case '+11':
+        return 'Add 11 to Result';
+      case 'draw1':
+        return 'Draw Extra Card';
+      case '-0.5':
+        return 'Subtract 0.5 from Result';
+      case 'rewind':
+        return 'Undo Last Field Card';
+      default:
+        return 'Unknown Modifier';
+    }
+  }
+
+  String _getModifierAssetPath(String modifier) {
+    switch (modifier) {
+      case 'rewind':
+        return 'assets/images/rewindmod.png';
+      case 'mulligan':
+        return 'assets/images/mulliganmod.png';
+      case 'draw1':
+        return 'assets/images/draw1mod.png';
+      case '-1':
+        return 'assets/images/-1mod.png';
+      case '-3':
+        return 'assets/images/-3mod.png';
+      case '-0.5':
+        return 'assets/images/-halfmod.png';
+      case '+1':
+        return 'assets/images/+1mod.png';
+      case '+3':
+        return 'assets/images/+3mod.png';
+      case '+11':
+        return 'assets/images/+11mod.png';
+      case '2x':
+        return 'assets/images/2xmod.png';
+      default:
+        return 'assets/images/rewindmod.png';
+    }
+  }
+
+  Widget buildOpponentModifierDisplay({required bool isMobile}) {
+    if (gameOver || showInitialOverlay) return const SizedBox.shrink();
+
+    // Ensure we have opponent available modifiers before displaying
+    if (opponentAvailableModifiers.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(
+        opponentAvailableModifiers.length > 3
+            ? 3
+            : opponentAvailableModifiers.length,
+        (index) {
+          if (index >= opponentAvailableModifiers.length) {
+            return SizedBox.shrink();
+          }
+
+          String modifierKey = opponentAvailableModifiers[index];
+          String displaySymbol = _getModifierDisplaySymbol(modifierKey);
+          bool isUsed = opponentModifiers[modifierKey] ?? false;
+
+          return Row(
+            children: [
+              if (index > 0) SizedBox(width: 8),
+              _buildOpponentModifierIndicator(displaySymbol, isUsed),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildModifierCard(String symbol, String tooltip, bool used,
+      {VoidCallback? onTap,
+      required bool isMobile,
+      bool isSelected = false,
+      String? modifierType}) {
+    bool isDisabled = onTap == null;
+
+    // Get border color
+    Color borderColor = used
+        ? Colors.grey[600]!
+        : (isSelected
+            ? const Color.fromARGB(247, 0, 255, 229) // border when selected
+            : (isDisabled
+                ? const Color.fromARGB(100, 134, 158, 255)
+                : const Color.fromARGB(255, 134, 158, 255)));
+
+    return Tooltip(
+      message: used ? '$tooltip (Used)' : tooltip,
+      child: GestureDetector(
+        onTap: onTap,
+        child: Opacity(
+          opacity: used ? 0.3 : (isDisabled ? 0.6 : 0.95),
+          child: Container(
+            width: isMobile ? 50 : 60,
+            height: isMobile ? 70 : 84,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: borderColor,
+                width: isSelected ? 3 : 2, // Thicker border when selected
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.4),
+                  blurRadius: 8,
+                  offset: const Offset(2, 4),
+                  spreadRadius: 1,
+                ),
+              ],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(
+                  6), // Slightly smaller to account for border
+              child: modifierType != null
+                  ? ColorFiltered(
+                      colorFilter: used
+                          ? const ColorFilter.matrix([
+                              0.2126, 0.7152, 0.0722, 0, 0, // Red channel
+                              0.2126, 0.7152, 0.0722, 0, 0, // Green channel
+                              0.2126, 0.7152, 0.0722, 0, 0, // Blue channel
+                              0, 0, 0, 1, 0, // Alpha channel
+                            ])
+                          : (isDisabled
+                              ? ColorFilter.mode(
+                                  Colors.grey.withOpacity(0.5),
+                                  BlendMode.srcATop,
+                                )
+                              : const ColorFilter.mode(
+                                  Colors.transparent,
+                                  BlendMode.multiply,
+                                )),
+                      child: Image.asset(
+                        _getModifierAssetPath(modifierType),
+                        fit: BoxFit.cover,
+                        width: double.infinity,
+                        height: double.infinity,
+                      ),
+                    )
+                  : Container(
+                      color: Colors.grey[800],
+                      child: Center(
+                        child: Text(
+                          '?',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: isMobile ? 18 : 22,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildOpponentModifierIndicator(String text, bool isUsed) {
+    return Container(
+      width: 24,
+      height: 24,
+      decoration: BoxDecoration(
+        color: isUsed
+            ? Colors.grey.withOpacity(0.5)
+            : Colors.blue.withOpacity(0.3),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(
+          color: isUsed ? Colors.grey : Colors.blue,
+          width: 1,
+        ),
+      ),
+      child: Center(
+        child: Text(
+          text,
+          style: TextStyle(
+            color: isUsed ? Colors.grey : Colors.white,
+            fontSize: 10,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
       ),
     );
   }
@@ -1463,10 +4401,11 @@ class _GameScreenState extends State<GameScreen> {
   Widget buildCardSelectionRow({
     required bool isMobile,
     required bool isTablet,
+    bool isSmallPhone = false,
+    double screenScale = 1.0,
   }) {
     if (selectedIndices.isEmpty) return const SizedBox.shrink();
 
-    // Emergency validation - if anything is wrong, clear and return empty
     for (int index in selectedIndices) {
       if (index < 0 || index >= playerHand.length) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1476,7 +4415,6 @@ class _GameScreenState extends State<GameScreen> {
       }
     }
 
-    // Ensure selectedOps has exactly the right length
     int expectedOpsLength = (selectedIndices.length - 1).clamp(0, 2);
     if (selectedOps.length != expectedOpsLength) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1490,20 +4428,44 @@ class _GameScreenState extends State<GameScreen> {
       return const SizedBox.shrink();
     }
 
+    // Responsive card sizing for selection row
+    final selectionCardWidth = isSmallPhone 
+        ? 55.0 
+        : (isMobile ? (76.0 * screenScale).clamp(55.0, 80.0) : (isTablet ? 50.0 : 60.0));
+    final selectionCardHeight = selectionCardWidth * 1.32;
+
+    // Adjust spacing based on number of cards and screen size
+    double cardSpacing = isSmallPhone 
+        ? 0.5 
+        : (selectedIndices.length >= 3 ? 1.0 : (isMobile ? 2.0 : 4.0));
+    double opSpacing = isSmallPhone
+        ? 0.25
+        : (selectedIndices.length >= 3 ? 0.5 : (isMobile ? 1.0 : 2.0));
+
     List<Widget> widgets = [];
 
     for (int i = 0; i < selectedIndices.length; i++) {
-      // Add card widget
       widgets.add(
         Container(
           decoration: BoxDecoration(
-            border: Border.all(color: Colors.yellow, width: 4),
+            border: Border.all(
+              color: const Color.fromARGB(227, 103, 164, 255),
+              width: isSmallPhone ? 3 : 4,
+            ),
             borderRadius: BorderRadius.circular(8),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.4),
+                blurRadius: 8,
+                offset: const Offset(2, 4),
+                spreadRadius: 1,
+              ),
+            ],
           ),
-          margin: EdgeInsets.symmetric(horizontal: isMobile ? 2.0 : 4.0),
+          margin: EdgeInsets.symmetric(horizontal: cardSpacing),
           child: SizedBox(
-            width: isMobile ? 35 : (isTablet ? 50 : 60),
-            height: isMobile ? 49 : (isTablet ? 70 : 84),
+            width: selectionCardWidth,
+            height: selectionCardHeight,
             child: CardWidget(
               value: playerHand[selectedIndices[i]],
               isJoker: playerHand[selectedIndices[i]] == 'jkr',
@@ -1512,16 +4474,15 @@ class _GameScreenState extends State<GameScreen> {
         ),
       );
 
-      // Add operation selector only if we need one AND it exists
       if (i < selectedIndices.length - 1 && i < selectedOps.length) {
         widgets.add(
           GestureDetector(
             onTap: () => toggleOperation(i),
             child: Container(
-              margin: EdgeInsets.symmetric(horizontal: isMobile ? 1.0 : 2.0),
+              margin: EdgeInsets.symmetric(horizontal: opSpacing),
               padding: EdgeInsets.symmetric(
-                horizontal: isMobile ? 4 : 8,
-                vertical: isMobile ? 4 : 8,
+                horizontal: isSmallPhone ? 2 : (isMobile ? 4 : 8),
+                vertical: isSmallPhone ? 2 : (isMobile ? 4 : 8),
               ),
               decoration: BoxDecoration(
                 color: Colors.black,
@@ -1532,10 +4493,10 @@ class _GameScreenState extends State<GameScreen> {
                 selectedOps[i],
                 style: TextStyle(
                   fontFamily: 'Courier',
-                  fontSize: isMobile ? 24 : (isTablet ? 28 : 32),
+                  fontSize: isSmallPhone ? 32 : (isMobile ? 48 : (isTablet ? 48 : 60)),
                   color: const Color.fromARGB(255, 104, 255, 210),
                   fontWeight: FontWeight.bold,
-                  shadows: [
+                  shadows: const [
                     Shadow(
                       blurRadius: 4,
                       color: Color.fromARGB(255, 218, 251, 255),
@@ -1550,586 +4511,1196 @@ class _GameScreenState extends State<GameScreen> {
       }
     }
 
-    // Add equals button
     if (isPlayerTurn && !gameOver) {
+      final bool canPlay = isSelectionValidForPlay();
       widgets.add(
         Padding(
-          padding: EdgeInsets.only(left: isMobile ? 8.0 : 16.0),
-          child: ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color.fromARGB(5, 194, 194, 194),
-              shape: const CircleBorder(),
-              padding: EdgeInsets.all(isMobile ? 12 : 18), // Remove const here
-              elevation: 8,
-              shadowColor: const Color.fromARGB(255, 123, 207, 255),
-            ),
-            onPressed: isSelectionValidForPlay()
-                ? () => playSelectedCards()
-                : null,
-            child: Text(
-              // Remove const here
-              '=',
-              style: TextStyle(
-                // Remove const here
-                fontFamily: 'Courier',
-                fontSize: isMobile ? 28 : (isTablet ? 32 : 36),
-                color: const Color.fromARGB(255, 237, 227, 240),
-                fontWeight: FontWeight.bold,
-                shadows: const [
-                  Shadow(
-                    blurRadius: 8,
-                    color: Color.fromARGB(255, 219, 242, 255),
-                    offset: Offset(0, 0),
-                  ),
-                ],
-              ),
-            ),
+          padding: EdgeInsets.only(left: isSmallPhone ? 4.0 : (isMobile ? 8.0 : 16.0)),
+          child: _PlayButton(
+            canPlay: canPlay,
+            onPressed: canPlay ? () => playSelectedCards() : null,
+            isMobile: isMobile,
+            isTablet: isTablet,
+            isSmallPhone: isSmallPhone,
           ),
         ),
       );
     }
 
-    return Row(mainAxisAlignment: MainAxisAlignment.center, children: widgets);
+    // Wrap in FittedBox for overflow protection on small screens
+    return FittedBox(
+      fit: BoxFit.scaleDown,
+      child: Row(mainAxisAlignment: MainAxisAlignment.center, children: widgets),
+    );
+  }
+
+  Widget _buildSearchingContent() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const _SearchingAnimation(),
+        const SizedBox(height: 20),
+        const Text(
+          'Quick Play',
+          style: TextStyle(
+            color: Color.fromARGB(255, 76, 175, 80),
+            fontSize: 24,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        const SizedBox(height: 12),
+        Text(
+          waitingForOpponent 
+              ? 'Waiting for opponent...'
+              : 'Searching for game...',
+          style: const TextStyle(
+            color: Colors.white70,
+            fontSize: 14,
+          ),
+        ),
+        const SizedBox(height: 24),
+        TextButton.icon(
+          onPressed: _cancelQuickMatch,
+          icon: const Icon(Icons.close, size: 18),
+          label: const Text('Cancel'),
+          style: TextButton.styleFrom(
+            foregroundColor: Colors.white54,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget buildVersusButton({required bool isMobile}) {
+    return Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 5 : 12,
+        vertical: isMobile ? 3 : 8,
+      ),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            const Color.fromARGB(255, 38, 97, 246).withOpacity(0.8),
+            const Color.fromARGB(255, 87, 111, 251).withOpacity(0.8),
+          ],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.15),
+            blurRadius: 4,
+            offset: const Offset(1, 2),
+          ),
+        ],
+        border: Border.all(
+          color: const Color.fromARGB(153, 78, 78, 255).withOpacity(0.7),
+          width: 1,
+        ),
+      ),
+      child: InkWell(
+        onTap: () => _showGameModeSelection(),
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: isMobile ? 6 : 12,
+            vertical: isMobile ? 3 : 6,
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                gameMode == 'ai' ? Icons.people : Icons.people,
+                color: const Color.fromARGB(247, 226, 235, 255),
+                size: isMobile ? 14 : 15,
+              ),
+              SizedBox(width: isMobile ? 6 : 8),
+              Text(
+                'Vs',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: isMobile ? 11 : 13,
+                  letterSpacing: 0.8,
+                  fontFamily: 'Roboto',
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget buildRoomSelectionOverlay({required bool isMobile}) {
+    final modalMaxWidth = MediaQuery.of(context).size.width - 40;
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black.withOpacity(0.8),
+        child: Center(
+          child: Container(
+            constraints: BoxConstraints(maxWidth: (isMobile ? 300.0 : 400.0).clamp(0, modalMaxWidth)),
+            padding: const EdgeInsets.all(24),
+            margin: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.9),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: const Color.fromARGB(255, 92, 90, 255).withOpacity(0.5),
+                width: 1.5,
+              ),
+            ),
+            child: isSearchingForGame
+                ? _buildSearchingContent()
+                : Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.groups,
+                  size: 60,
+                  color: Color.fromARGB(255, 92, 96, 255),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Versus Mode',
+                  style: TextStyle(
+                    color: Color.fromARGB(255, 92, 96, 255),
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                if (connectionStatus.isNotEmpty && !isSearchingForGame) ...[
+                  Text(
+                    connectionStatus,
+                    style: TextStyle(
+                      color: connectionStatus.contains('Error')
+                          ? Colors.red
+                          : Colors.white70,
+                      fontSize: 14,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 16),
+                ],
+                // Quick Play - Primary action
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color.fromARGB(255, 76, 175, 80),
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(double.infinity, 52),
+                    elevation: 4,
+                  ),
+                  onPressed: _searchForGame,
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.flash_on, size: 20),
+                      SizedBox(width: 8),
+                      Text(
+                        'Quick Play',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+                // Divider with "or"
+                Row(
+                  children: [
+                    Expanded(
+                      child: Container(
+                        height: 1,
+                        color: Colors.white24,
+                      ),
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 12),
+                      child: Text(
+                        'or use a room code',
+                        style: TextStyle(
+                          color: Colors.white38,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: Container(
+                        height: 1,
+                        color: Colors.white24,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                // Room code options in a row
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white70,
+                          side: const BorderSide(color: Colors.white24),
+                          minimumSize: const Size(0, 44),
+                        ),
+                        onPressed: _createRoom,
+                        child: const Text('Create'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white70,
+                          side: const BorderSide(color: Colors.white24),
+                          minimumSize: const Size(0, 44),
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            showJoinRoom = true;
+                            showRoomSelection = false;
+                          });
+                        },
+                        child: const Text('Join'),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                TextButton(
+                  onPressed: _cancelRoomSelection,
+                  child: const Text(
+                    'Cancel',
+                    style: TextStyle(color: Colors.white54),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget buildCreateRoomOverlay({required bool isMobile}) {
+    final modalMaxWidth = MediaQuery.of(context).size.width - 40;
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black.withOpacity(0.8),
+        child: Center(
+          child: Container(
+            constraints: BoxConstraints(maxWidth: (isMobile ? 300.0 : 400.0).clamp(0, modalMaxWidth)),
+            padding: const EdgeInsets.all(24),
+            margin: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.9),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: const Color.fromARGB(255, 255, 64, 129).withOpacity(0.5),
+                width: 1.5,
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.add_circle,
+                  size: 60,
+                  color: Color.fromARGB(255, 255, 64, 129),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Create Room',
+                  style: TextStyle(
+                    color: Color.fromARGB(255, 255, 64, 129),
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                if (waitingForOpponent) ...[
+                  Text(
+                    'Room Code: $roomCode',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 2,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  const CircularProgressIndicator(
+                    color: Color.fromARGB(255, 255, 64, 129),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Waiting for opponent...',
+                    style: TextStyle(color: Color.fromARGB(179, 237, 239, 240)),
+                  ),
+                  const SizedBox(height: 24),
+                  TextButton(
+                    onPressed: () {
+                      _leaveRoom(); // This now handles cleanup properly
+                    },
+                    child: const Text(
+                      'Cancel',
+                      style: TextStyle(color: Colors.white54),
+                    ),
+                  ),
+                ] else ...[
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color.fromARGB(255, 255, 64, 129),
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(double.infinity, 48),
+                    ),
+                    onPressed: _createRoom,
+                    child: const Text('Create'),
+                  ),
+                  const SizedBox(height: 16),
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        showCreateRoom = false;
+                        showRoomSelection = true;
+                      });
+                    },
+                    child: const Text(
+                      'Back',
+                      style: TextStyle(color: Colors.white54),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget buildJoinRoomOverlay({required bool isMobile}) {
+    final modalMaxWidth = MediaQuery.of(context).size.width - 40;
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black.withOpacity(0.8),
+        child: Center(
+          child: Container(
+            constraints: BoxConstraints(maxWidth: (isMobile ? 300.0 : 400.0).clamp(0, modalMaxWidth)),
+            padding: const EdgeInsets.all(24),
+            margin: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.9),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: const Color.fromARGB(255, 255, 64, 129).withOpacity(0.5),
+                width: 1.5,
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.login,
+                  size: 60,
+                  color: Color.fromARGB(255, 255, 64, 129),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Join Room',
+                  style: TextStyle(
+                    color: Color.fromARGB(255, 255, 64, 129),
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                TextField(
+                  controller: roomCodeController,
+                  decoration: InputDecoration(
+                    hintText: 'Enter room code',
+                    hintStyle: const TextStyle(color: Colors.white54),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(color: Colors.white54),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: const BorderSide(
+                        color: Color.fromARGB(255, 255, 64, 129),
+                      ),
+                    ),
+                  ),
+                  style: const TextStyle(color: Colors.white),
+                  textCapitalization: TextCapitalization.characters,
+                  maxLength: 3,
+                ),
+                const SizedBox(height: 16),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color.fromARGB(244, 255, 64, 128),
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(double.infinity, 48),
+                  ),
+                  onPressed: () {
+                    if (roomCodeController.text.trim().isNotEmpty) {
+                      _joinRoom(roomCodeController.text.trim());
+                    }
+                  },
+                  child: const Text('Join'),
+                ),
+                const SizedBox(height: 16),
+                TextButton(
+                  onPressed: () {
+                    setState(() {
+                      showJoinRoom = false;
+                      showRoomSelection = true;
+                      roomCodeController.clear();
+                    });
+                  },
+                  child: const Text(
+                    'Back',
+                    style: TextStyle(color: Colors.white54),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // Add MediaQuery breakpoints here
     final screenSize = MediaQuery.of(context).size;
     final screenWidth = screenSize.width;
     final screenHeight = screenSize.height;
+    
+    // Improved responsive breakpoints
+    final isSmallPhone = screenWidth < 360;
     final isMobile = screenWidth < 600;
     final isTablet = screenWidth >= 600 && screenWidth < 1024;
-    final isDesktop = screenWidth >= 1024;
-    final isShortScreen = screenHeight < 900;
-    final verticalSpacing = isShortScreen ? 8.0 : (isMobile ? 16 : 32);
+    final isLandscape = screenWidth > screenHeight && screenHeight < 500;
+    final isShortScreen = screenHeight < 600 || isLandscape;
+    
+    // Dynamic scaling factor based on screen width (normalized to Pixel 7's 412px)
+    final screenScale = (screenWidth / 412).clamp(0.8, 1.3);
+    
+    // Responsive card dimensions
+    final playerCardWidth = isMobile 
+        ? (isSmallPhone ? 65.0 : 80.0 * screenScale).clamp(60.0, 85.0)
+        : (isTablet ? 60.0 : 75.0);
+    final playerCardHeight = playerCardWidth * 1.31; // Maintain aspect ratio
+    
+    final prizeCardWidth = isMobile
+        ? (isSmallPhone ? 45.0 : 55.0 * screenScale).clamp(42.0, 60.0)
+        : (isTablet ? 55.0 : 70.0);
+    final prizeCardHeight = prizeCardWidth * 1.4;
+    
+    final fieldCardWidth = isMobile
+        ? (isSmallPhone ? 60.0 : 75.0 * screenScale).clamp(55.0, 80.0)
+        : (isTablet ? 65.0 : 80.0);
+    final fieldCardHeight = fieldCardWidth * 1.4;
+    
+    final opponentCardWidth = isMobile
+        ? (isSmallPhone ? 45.0 : 55.0 * screenScale).clamp(42.0, 60.0)
+        : (isTablet ? 55.0 : 70.0);
+    final opponentCardHeight = opponentCardWidth * 1.4;
+    
+    // Responsive spacing
+    final verticalSpacingSmall = isShortScreen ? 4.0 : (isMobile ? 8.0 : 12.0);
+    final verticalSpacingMedium = isShortScreen ? 8.0 : (isMobile ? 16.0 : 32.0);
+    final horizontalCardSpacing = isSmallPhone ? 2.0 : (isMobile ? 4.0 : 8.0);
 
     return Scaffold(
-      appBar: null, // Removes any app bar
+      appBar: null,
       extendBodyBehindAppBar: true,
       extendBody: true,
       body: SafeArea(
         child: Stack(
           children: [
-            // Background layer (static)
             Positioned.fill(
-              child: Image.asset(
-                'assets/images/playmat.png',
-                fit: BoxFit.cover,
-                alignment: Alignment.topCenter,
+              child: AnimatedSwitcher(
+                duration: Duration(milliseconds: 1500),
+                transitionBuilder: (Widget child, Animation<double> animation) {
+                  return FadeTransition(
+                    opacity: animation,
+                    child: child,
+                  );
+                },
+                child: Transform.scale(
+                  scale: 4.5,
+                  child: Image.asset(
+                    backgrounds[currentBackgroundIndex],
+                    key: ValueKey(backgrounds[currentBackgroundIndex]),
+                    fit: BoxFit.cover,
+                    alignment: Alignment.center,
+                  ),
+                ),
               ),
             ),
-            // Content layer
             Padding(
               padding: EdgeInsets.all(
                 isMobile ? 16.0 : (isTablet ? 20.0 : 24.0),
               ),
-              child: SingleChildScrollView(
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(
-                    minHeight: isMobile ? screenHeight * 0.9 : screenHeight,
-                  ),
-                  child: IntrinsicHeight(
-                    child: Column(
-                      mainAxisAlignment: isMobile
-                          ? MainAxisAlignment.start
-                          : MainAxisAlignment.center,
-                      children: [
-                        // Opponent's prize cards (face-down)
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment
-                              .center, // Leave this one unchanged
-                          children: List.generate(
-                            opponentPrizeCards.length,
-                            (_) => Padding(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: isMobile ? 2.0 : 4.0,
-                              ),
-                              child: SizedBox(
-                                width: isMobile ? 40 : (isTablet ? 55 : 70),
-                                height: isMobile
-                                    ? 56
-                                    : (isTablet
-                                          ? 77
-                                          : 98), // Maintain card aspect ratio (1.4)
-                                child: CardWidget(isCardBack: true),
-                              ),
-                            ),
-                          ),
+              child: Column(
+                children: [
+                  Flexible(
+                    child: SingleChildScrollView(
+                      child: Padding(
+                        padding: EdgeInsets.only(
+                          top: isShortScreen ? 60 : (isMobile ? 85 : 95),
+                          bottom: isShortScreen ? 4 : (isMobile ? 8 : 16),
+                          left: 0,
+                          right: 0,
                         ),
-                        SizedBox(height: isMobile ? 8 : 16),
-                        // Opponent's hand (hidden)
-                        Row(
+                        child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
-                          children: List.generate(
-                            opponentHand.length,
-                            (_) => Padding(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: isMobile ? 2.0 : 4.0,
-                              ),
-                              child: SizedBox(
-                                width: isMobile ? 40 : (isTablet ? 55 : 70),
-                                height: isMobile ? 56 : (isTablet ? 77 : 98),
-                                child: CardWidget(isCardBack: true),
-                              ),
-                            ),
-                          ),
-                        ),
-                        SizedBox(height: isMobile ? 16 : 32),
-                        // Field area (last played card, if any) + Timer to the far right
-                        Row(
-                          crossAxisAlignment: CrossAxisAlignment.center,
                           children: [
-                            // Left spacer - smaller on mobile
-                            Expanded(
-                              flex: isMobile ? 1 : 2,
-                              child: Container(),
-                            ),
-                            // Centered field card
+// UPDATED: Opponent modifiers positioned above opponent prize cards - now shows randomly assigned modifiers
+                            buildOpponentModifierDisplay(isMobile: isMobile),
+
+                            SizedBox(height: verticalSpacingSmall),
+// Opponent prize cards (top) - with animated transitions
                             AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 330),
-                              transitionBuilder:
-                                  (Widget child, Animation<double> animation) {
+                              duration: const Duration(milliseconds: 300),
+                              transitionBuilder: (child, animation) {
+                                return FadeTransition(
+                                  opacity: animation,
+                                  child: child,
+                                );
+                              },
+                              child: Row(
+                                key: ValueKey<int>(opponentPrizeCards.length),
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: List.generate(
+                                  opponentPrizeCards.length,
+                                  (index) => TweenAnimationBuilder<double>(
+                                    key: ValueKey('opp_prize_$index'),
+                                    tween: Tween(begin: 0.8, end: 1.0),
+                                    duration: Duration(milliseconds: 300 + index * 50),
+                                    curve: Curves.elasticOut,
+                                    builder: (context, scale, child) {
+                                      return Transform.scale(
+                                        scale: scale,
+                                        child: child,
+                                      );
+                                    },
+                                    child: Padding(
+                                      padding: EdgeInsets.symmetric(
+                                        horizontal: horizontalCardSpacing / 2,
+                                      ),
+                                      child: FloatingPrizeCard(
+                                        index: index,
+                                        child: Container(
+                                          width: prizeCardWidth,
+                                          height: prizeCardHeight,
+                                          decoration: BoxDecoration(
+                                            borderRadius: BorderRadius.circular(8),
+                                            boxShadow: [
+                                              BoxShadow(
+                                                color:
+                                                    Colors.black.withOpacity(0.4),
+                                                blurRadius: 8,
+                                                offset: const Offset(2, 4),
+                                                spreadRadius: 1,
+                                              ),
+                                            ],
+                                          ),
+                                          child: const CardWidget(isCardBack: true),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            SizedBox(height: verticalSpacingSmall),
+// Opponent hand
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: List.generate(
+                                opponentHand.length,
+                                (_) => Padding(
+                                  padding: EdgeInsets.symmetric(
+                                    horizontal: horizontalCardSpacing / 2,
+                                  ),
+                                  child: Container(
+                                    width: opponentCardWidth,
+                                    height: opponentCardHeight,
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(8),
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: Colors.black.withOpacity(0.4),
+                                          blurRadius: 8,
+                                          offset: const Offset(2, 4),
+                                          spreadRadius: 1,
+                                        ),
+                                      ],
+                                    ),
+                                    child: const CardWidget(isCardBack: true),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            SizedBox(height: verticalSpacingMedium),
+// Field area
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              children: [
+                                Expanded(
+                                  flex: isMobile ? 1 : 2,
+                                  child: !showInitialOverlay
+                                      ? Container(
+                                          constraints: BoxConstraints(
+                                            maxWidth: isSmallPhone
+                                                ? 140
+                                                : (isMobile ? 180 : (isTablet ? 200 : 250)),
+                                            minHeight: isMobile ? 40 : 50,
+                                            maxHeight: isShortScreen ? 60 : (isMobile ? 80 : 100),
+                                          ),
+                                          padding: EdgeInsets.symmetric(
+                                            horizontal: isMobile ? 8 : 12,
+                                            vertical: isMobile ? 6 : 8,
+                                          ),
+                                          margin: EdgeInsets.only(
+                                            right: isMobile ? 8 : 12,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: const Color.fromARGB(
+                                                    180, 48, 43, 51)
+                                                .withOpacity(0.15),
+                                            borderRadius:
+                                                BorderRadius.circular(8),
+                                            border: Border.all(
+                                              color:
+                                                  Colors.white.withOpacity(0.1),
+                                              width: 0.5,
+                                            ),
+                                          ),
+                                          alignment: Alignment.centerLeft,
+                                          child: AnimatedSwitcher(
+                                            duration: const Duration(milliseconds: 250),
+                                            transitionBuilder: (Widget child, Animation<double> animation) {
+                                              return SlideTransition(
+                                                position: Tween<Offset>(
+                                                  begin: const Offset(0, 0.4),
+                                                  end: Offset.zero,
+                                                ).animate(CurvedAnimation(
+                                                  parent: animation,
+                                                  curve: Curves.easeOutCubic,
+                                                )),
+                                                child: FadeTransition(
+                                                  opacity: animation,
+                                                  child: child,
+                                                ),
+                                              );
+                                            },
+                                            child: activityLog.isNotEmpty
+                                                ? Text(
+                                                    activityLog.last,
+                                                    key: ValueKey<String>(activityLog.last + activityLog.length.toString()),
+                                                    textAlign: TextAlign.left,
+                                                    style: TextStyle(
+                                                      color: activityLogColor,
+                                                      fontSize: isMobile
+                                                          ? 14
+                                                          : (isTablet ? 14 : 16),
+                                                      height: 1.2,
+                                                      fontWeight: FontWeight.w500,
+                                                      fontFamily: 'Roboto',
+                                                    ),
+                                                  )
+                                                : const SizedBox.shrink(key: ValueKey('empty')),
+                                          ),
+                                        )
+                                      : const SizedBox.shrink(),
+                                ),
+                                AnimatedSwitcher(
+                                  duration: const Duration(milliseconds: 330),
+                                  transitionBuilder: (Widget child,
+                                      Animation<double> animation) {
                                     return FadeTransition(
                                       opacity: animation,
                                       child: ScaleTransition(
-                                        scale: Tween<double>(
-                                          begin: 0.95,
-                                          end: 1.0,
-                                        ).animate(animation),
+                                        scale:
+                                            Tween<double>(begin: 0.95, end: 1.0)
+                                                .animate(animation),
                                         child: child,
                                       ),
                                     );
                                   },
-                              child: field.isNotEmpty
-                                  ? SizedBox(
-                                      key: ValueKey(field.last),
-                                      width: isMobile
-                                          ? 50
-                                          : (isTablet ? 65 : 80),
-                                      height: isMobile
-                                          ? 70
-                                          : (isTablet ? 91 : 112),
-                                      child: CardWidget(
-                                        value: field.last,
-                                        isJoker: field.last == 'jkr',
-                                      ),
-                                    )
-                                  : const SizedBox.shrink(),
-                            ),
-                            // Right spacer with activity log and timer
-                            Expanded(
-                              flex: isMobile ? 1 : 2,
-                              child: Row(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  // Activity log - hide on very small screens
-                                  if (screenWidth > 350)
-                                    Flexible(
-                                      child: Container(
-                                        constraints: BoxConstraints(
-                                          maxWidth: isMobile
-                                              ? 80
-                                              : (isTablet ? 140 : 180),
-                                          minHeight: isMobile ? 25 : 35,
-                                          maxHeight: isMobile ? 40 : 50,
-                                        ),
-                                        padding: EdgeInsets.symmetric(
-                                          horizontal: isMobile ? 6 : 10,
-                                          vertical: isMobile ? 4 : 6,
-                                        ),
-                                        margin: EdgeInsets.only(
-                                          right: isMobile ? 6 : 10,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: const Color.fromARGB(
-                                            6,
-                                            159,
-                                            154,
-                                            230,
-                                          ).withOpacity(0.5),
-                                          borderRadius: BorderRadius.circular(
-                                            6,
-                                          ),
-                                        ),
-                                        alignment: Alignment.centerRight,
-                                        child: activityLog.isNotEmpty
-                                            ? Text(
-                                                activityLog.last,
-                                                overflow: TextOverflow.ellipsis,
-                                                maxLines: 2,
-                                                textAlign: TextAlign.right,
-                                                style: TextStyle(
-                                                  color: const Color.fromARGB(
-                                                    242,
-                                                    246,
-                                                    252,
-                                                    255,
-                                                  ),
-                                                  fontSize: isMobile
-                                                      ? 8
-                                                      : (isTablet ? 10 : 12),
-                                                  height: 1.2,
-                                                ),
-                                              )
-                                            : const SizedBox.shrink(),
-                                      ),
-                                    ),
-                                  // Timer
-                                  buildTimer(
-                                    isMobile: isMobile,
-                                    isTablet: isTablet,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                        SizedBox(height: isMobile ? 16 : 32),
-                        // Card selection row (shows selected cards and operation selectors, with = button)
-                        buildCardSelectionRow(
-                          isMobile: isMobile,
-                          isTablet: isTablet,
-                        ),
-                        // Player's hand (visible and selectable if it's player's turn)
-                        AnimatedContainer(
-                          duration: const Duration(milliseconds: 300),
-                          decoration: isPlayerTurn && !gameOver
-                              ? BoxDecoration(
-                                  boxShadow: [
-                                    BoxShadow(
-                                      color: const Color.fromARGB(
-                                        148,
-                                        104,
-                                        228,
-                                        201,
-                                      ).withOpacity(0.25),
-                                      blurRadius: 24,
-                                      spreadRadius: 4,
-                                    ),
-                                  ],
-                                )
-                              : null,
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: List.generate(playerHand.length, (index) {
-                              String cardValue = playerHand[index];
-                              bool isSelected = selectedIndices.contains(index);
-                              return GestureDetector(
-                                onTap: isPlayerTurn && !gameOver
-                                    ? () => toggleCardSelection(index)
-                                    : null,
-                                child: Opacity(
-                                  opacity: isPlayerTurn && !gameOver
-                                      ? 1.0
-                                      : 0.5,
-                                  child: Container(
-                                    decoration: BoxDecoration(
-                                      border: isSelected
-                                          ? Border.all(
-                                              color: const Color.fromARGB(
-                                                88,
-                                                134,
-                                                110,
-                                                141,
+                                  child: field.isNotEmpty
+                                      ? Container(
+                                          key: ValueKey(field.last),
+                                          width: fieldCardWidth,
+                                          height: fieldCardHeight,
+                                          decoration: BoxDecoration(
+                                            borderRadius:
+                                                BorderRadius.circular(8),
+                                            boxShadow: [
+                                              BoxShadow(
+                                                color: Colors.black
+                                                    .withOpacity(0.4),
+                                                blurRadius: 8,
+                                                offset: const Offset(2, 4),
+                                                spreadRadius: 1,
                                               ),
-                                              width: 4,
-                                            )
-                                          : null,
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                    margin: EdgeInsets.symmetric(
-                                      horizontal: isMobile ? 4.0 : 8.0,
-                                    ),
-                                    child: SizedBox(
-                                      width: isMobile
-                                          ? 45
-                                          : (isTablet ? 60 : 75),
-                                      height: isMobile
-                                          ? 63
-                                          : (isTablet ? 84 : 105),
-                                      child: CardWidget(
-                                        value: cardValue,
-                                        isJoker: cardValue == 'jkr',
-                                      ),
-                                    ),
-                                  ),
+                                            ],
+                                          ),
+                                          child: CardWidget(
+                                            value: field.last,
+                                            isJoker: field.last == 'jkr',
+                                          ),
+                                        )
+                                      : const SizedBox.shrink(),
                                 ),
-                              );
-                            }),
-                          ),
-                        ),
-                        SizedBox(height: isMobile ? 8 : 16),
-                        // Player's prize cards (face-down)
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: List.generate(
-                            playerPrizeCards.length,
-                            (_) => Padding(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: isMobile ? 2.0 : 4.0,
-                              ),
-                              child: SizedBox(
-                                width: isMobile ? 40 : (isTablet ? 55 : 70),
-                                height: isMobile ? 56 : (isTablet ? 77 : 98),
-                                child: CardWidget(isCardBack: true),
-                              ),
-                            ),
-                          ),
-                        ),
-                        SizedBox(height: isMobile ? 16 : 24),
-                        // Message
-                        Text(
-                          message,
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: isMobile ? 14 : (isTablet ? 16 : 18),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            // Win/Lose Overlay
-            if (gameOver)
-              Positioned.fill(
-                child: Container(
-                  color: Colors.black.withOpacity(0.7),
-                  child: Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Text(
-                          winner == 'player' ? '=1' : 'D=',
-                          style: TextStyle(
-                            fontFamily: 'Courier',
-                            fontSize: 100,
-                            color: winner == 'player'
-                                ? Colors.greenAccent
-                                : Colors.redAccent,
-                            fontWeight: FontWeight.bold,
-                            shadows: [
-                              Shadow(
-                                blurRadius: 12,
-                                color: winner == 'player'
-                                    ? Colors.greenAccent
-                                    : Colors.redAccent,
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 24),
-                        Text(
-                          winner == 'player' ? 'You Win!' : 'You Lose!',
-                          style: TextStyle(
-                            color: winner == 'player'
-                                ? Colors.greenAccent
-                                : Colors.redAccent,
-                            fontSize: 48,
-                            fontWeight: FontWeight.bold,
-                            shadows: [
-                              Shadow(
-                                blurRadius: 12,
-                                color: winner == 'player'
-                                    ? Colors.greenAccent
-                                    : Colors.redAccent,
-                              ),
-                            ],
-                          ),
-                        ),
-                        SizedBox(height: isMobile ? 16 : 32),
-                        ElevatedButton(
-                          onPressed: () => setState(() => _setupGame()),
-                          child: const Text('Next Game'),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            // NEW: Initial Overlay
-            if (showInitialOverlay)
-              Positioned.fill(
-                child: Container(
-                  color: Colors.black.withOpacity(0.7),
-                  child: Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(
-                          Icons.content_cut_sharp,
-                          size: 100,
-                          color: Color.fromARGB(255, 77, 104, 255),
-                          shadows: [
-                            Shadow(blurRadius: 12, color: Colors.indigo),
-                          ],
-                        ),
-                        const SizedBox(height: 24),
-                        const Text(
-                          'Start Game',
-                          style: TextStyle(
-                            color: Color.fromARGB(255, 77, 104, 255),
-                            fontSize: 48,
-                            fontWeight: FontWeight.bold,
-                            shadows: [
-                              Shadow(blurRadius: 12, color: Colors.indigo),
-                            ],
-                          ),
-                        ),
-                        SizedBox(height: isMobile ? 16 : 32),
-                        ElevatedButton(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Color.fromARGB(255, 77, 104, 255),
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 32,
-                              vertical: 16,
-                            ),
-                          ),
-                          onPressed: () {
-                            setState(() {
-                              showInitialOverlay = false;
-                            });
-                            startTimer(); // Start the timer when game begins
-                          },
-                          child: const Text(
-                            'Play',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        // Learn to Play Section
-                        GestureDetector(
-                          onTap: () {
-                            setState(() {
-                              showRules = !showRules;
-                            });
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 8,
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                // Invisible spacer to balance the caret
-                                SizedBox(
-                                  width: 28,
-                                ), // 20 (icon size) + 8 (spacing)
-                                Text(
-                                  'Learn to Play',
-                                  style: TextStyle(
-                                    color: const Color.fromARGB(
-                                      192,
-                                      242,
-                                      244,
-                                      255,
-                                    ),
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w500,
-                                    decoration: TextDecoration.underline,
-                                    decorationColor: const Color.fromARGB(
-                                      180,
-                                      175,
-                                      182,
-                                      223,
-                                    ).withOpacity(0.8),
+                                Expanded(
+                                  flex: isMobile ? 1 : 2,
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.end,
+                                    children: [
+                                      if (!showInitialOverlay)
+                                        buildTimer(
+                                          isMobile: isMobile,
+                                          isTablet: isTablet,
+                                          isSmallPhone: isSmallPhone,
+                                          isShortScreen: isShortScreen,
+                                        ),
+                                    ],
                                   ),
-                                ),
-                                const SizedBox(width: 8),
-                                Icon(
-                                  showRules
-                                      ? Icons.expand_less
-                                      : Icons.expand_more,
-                                  color: Color.fromARGB(182, 77, 104, 255),
-                                  size: 20,
                                 ),
                               ],
                             ),
-                          ),
-                        ),
-                        // Expandable Rules
-                        AnimatedContainer(
-                          duration: const Duration(milliseconds: 300),
-                          curve: Curves.easeInOut,
-                          height: showRules ? null : 0,
-                          child: showRules
-                              ? Container(
-                                  constraints: BoxConstraints(
-                                    maxWidth: isMobile ? 300 : 400,
-                                  ),
-                                  padding: const EdgeInsets.all(16),
-                                  margin: const EdgeInsets.symmetric(
-                                    horizontal: 20,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.black.withOpacity(0.3),
-                                    borderRadius: BorderRadius.circular(12),
-                                    border: Border.all(
-                                      color: const Color.fromARGB(
-                                        255,
-                                        87,
-                                        111,
-                                        251,
-                                      ).withOpacity(0.3),
-                                      width: 1,
+                            SizedBox(height: verticalSpacingMedium),
+                            buildCardSelectionRow(
+                              isMobile: isMobile,
+                              isTablet: isTablet,
+                              isSmallPhone: isSmallPhone,
+                              screenScale: screenScale,
+                            ),
+// Player hand with turn indicator
+                            _TurnIndicatorContainer(
+                              isPlayerTurn: isPlayerTurn && !gameOver,
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children:
+                                    List.generate(playerHand.length, (index) {
+                                  String cardValue = playerHand[index];
+                                  bool isSelected =
+                                      selectedIndices.contains(index);
+                                  bool isInteractive = isPlayerTurn && !gameOver;
+                                  return GestureDetector(
+                                    onTap: isInteractive
+                                        ? () => toggleCardSelection(index)
+                                        : null,
+                                    child: AnimatedContainer(
+                                      duration: const Duration(milliseconds: 150),
+                                      curve: Curves.easeOutCubic,
+                                      transform: Matrix4.translationValues(
+                                        0,
+                                        isSelected ? -12 : 0,
+                                        0,
+                                      ),
+                                      child: AnimatedScale(
+                                        scale: isSelected ? 1.05 : 1.0,
+                                        duration: const Duration(milliseconds: 150),
+                                        curve: Curves.easeOutCubic,
+                                        child: AnimatedOpacity(
+                                          duration: const Duration(milliseconds: 200),
+                                          opacity: isInteractive ? 1.0 : 0.5,
+                                          child: AnimatedContainer(
+                                            duration: const Duration(milliseconds: 150),
+                                            decoration: BoxDecoration(
+                                              borderRadius: BorderRadius.circular(8),
+                                              border: Border.all(
+                                                color: isSelected
+                                                    ? const Color.fromARGB(200, 100, 180, 255)
+                                                    : Colors.transparent,
+                                                width: isSelected ? 2.5 : 0,
+                                              ),
+                                              boxShadow: [
+                                                BoxShadow(
+                                                  color: isSelected
+                                                      ? const Color.fromARGB(60, 100, 180, 255)
+                                                      : Colors.black.withOpacity(0.4),
+                                                  blurRadius: isSelected ? 16 : 8,
+                                                  offset: Offset(2, isSelected ? 8 : 4),
+                                                  spreadRadius: isSelected ? 2 : 1,
+                                                ),
+                                              ],
+                                            ),
+                                            margin: EdgeInsets.symmetric(
+                                                horizontal: horizontalCardSpacing),
+                                            child: SizedBox(
+                                              width: playerCardWidth,
+                                              height: playerCardHeight,
+                                              child: CardWidget(
+                                                value: cardValue,
+                                                isJoker: cardValue == 'jkr',
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                }),
+                              ),
+                            ),
+                            SizedBox(height: verticalSpacingSmall),
+// Player prize cards - with animated transitions  
+                            AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 300),
+                              transitionBuilder: (child, animation) {
+                                return FadeTransition(
+                                  opacity: animation,
+                                  child: child,
+                                );
+                              },
+                              child: Row(
+                                key: ValueKey<int>(playerPrizeCards.length),
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: List.generate(
+                                  playerPrizeCards.length,
+                                  (index) => TweenAnimationBuilder<double>(
+                                    key: ValueKey('player_prize_$index'),
+                                    tween: Tween(begin: 0.8, end: 1.0),
+                                    duration: Duration(milliseconds: 300 + index * 50),
+                                    curve: Curves.elasticOut,
+                                    builder: (context, scale, child) {
+                                      return Transform.scale(
+                                        scale: scale,
+                                        child: child,
+                                      );
+                                    },
+                                    child: Padding(
+                                      padding: EdgeInsets.symmetric(
+                                        horizontal: horizontalCardSpacing / 2,
+                                      ),
+                                      child: FloatingPrizeCard(
+                                        index: index,
+                                        child: Container(
+                                          width: prizeCardWidth,
+                                          height: prizeCardHeight,
+                                          decoration: BoxDecoration(
+                                            borderRadius: BorderRadius.circular(8),
+                                            boxShadow: [
+                                              BoxShadow(
+                                                color:
+                                                    Colors.black.withOpacity(0.4),
+                                                blurRadius: 8,
+                                                offset: const Offset(2, 4),
+                                                spreadRadius: 1,
+                                              ),
+                                            ],
+                                          ),
+                                          child: const CardWidget(isCardBack: true),
+                                        ),
+                                      ),
                                     ),
                                   ),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      _buildRuleItem(
-                                        'Take turns playing cards against your opponent',
-                                      ),
-                                      const SizedBox(height: 8),
-                                      _buildRuleItem(
-                                        'Double or halve the last played card to win a point',
-                                      ),
-                                      const SizedBox(height: 8),
-                                      _buildRuleItem(
-                                        'Add or subtract your cards for strategic plays',
-                                      ),
-                                    ],
-                                  ),
-                                )
-                              : const SizedBox.shrink(),
+                                ),
+                              ),
+                            ),
+                            SizedBox(height: verticalSpacingSmall),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (gameOver)
+              Positioned.fill(
+                child: _GameOverOverlay(
+                  winner: winner,
+                  isMobile: isMobile,
+                  waitingForRematch: _waitingForRematch,
+                  gameMode: gameMode,
+                  onNextGame: () {
+                    if (gameMode == 'human') {
+                      setState(() {
+                        _waitingForRematch = true;
+                      });
+                      _startRematch();
+                    } else {
+                      setState(() {
+                        _setupGame();
+                      });
+                    }
+                  },
+                  onLeaveRoom: () {
+                    _leaveRoom();
+                    setState(() {
+                      showInitialOverlay = true;
+                    });
+                  },
+                ),
+              ),
+            if (showInitialOverlay && !isSearchingForGame && !waitingForOpponent)
+  Positioned.fill(
+    child: Container(
+      color: Colors.black.withOpacity(0.7),
+      child: Stack(
+        children: [
+          Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(
+                  Icons.content_cut_sharp,
+                  size: 100,
+                  color: Color.fromARGB(255, 77, 104, 255),
+                  shadows: [
+                    Shadow(blurRadius: 12, color: Colors.indigo),
+                  ],
+                ),
+                const SizedBox(height: 24),
+                const Text(
+                  ' ',
+                  style: TextStyle(
+                    color: Color.fromARGB(255, 77, 104, 255),
+                    fontSize: 48,
+                    fontWeight: FontWeight.bold,
+                    shadows: [
+                      Shadow(blurRadius: 12, color: Colors.indigo),
+                    ],
+                  ),
+                ),
+                SizedBox(height: isMobile ? 16 : 32),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Color.fromARGB(255, 77, 104, 255),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 32,
+                      vertical: 16,
+                    ),
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      showInitialOverlay = false;
+                    });
+                    if (gameMode == 'ai') {
+                      startTimer();
+                    }
+                  },
+                  child: const Text(
+                    'Play',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                GestureDetector(
+                  onTap: () {
+                    setState(() {
+                      showRules = !showRules;
+                    });
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(width: 28),
+                        Text(
+                          'How to Play',
+                          style: TextStyle(
+                            color: const Color.fromARGB(
+                                192, 242, 244, 255),
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                            decoration: TextDecoration.underline,
+                            decorationColor:
+                                const Color.fromARGB(180, 175, 182, 223)
+                                    .withOpacity(0.8),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Icon(
+                          showRules
+                              ? Icons.expand_less
+                              : Icons.expand_more,
+                          color: Color.fromARGB(182, 77, 104, 255),
+                          size: 20,
                         ),
                       ],
                     ),
                   ),
                 ),
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeInOut,
+                  height: showRules ? null : 0,
+                  child: showRules
+                      ? Container(
+                          constraints: BoxConstraints(
+                            maxWidth: isMobile ? 300 : 400,
+                          ),
+                          padding: const EdgeInsets.all(16),
+                          margin: const EdgeInsets.symmetric(
+                              horizontal: 20),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.3),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: const Color.fromARGB(
+                                      255, 87, 111, 251)
+                                  .withOpacity(0.3),
+                              width: 1,
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment:
+                                CrossAxisAlignment.start,
+                            children: [
+                              _buildRuleItem(
+                                  'Take turns playing cards against your opponent'),
+                              const SizedBox(height: 8),
+                              _buildRuleItem(
+                                  'Double or halve the last played card to win a point'),
+                              const SizedBox(height: 8),
+                              _buildRuleItem(
+                                  'Add or subtract your cards for strategic plays'),
+                              const SizedBox(height: 8),
+                              _buildRuleItemWithLink('Learn more!',
+                                  'https://docs.google.com/document/d/e/2PACX-1vSfJARnFyszfTiIxJC9iXQ2JIERtpgm5RDEu8cWfdPXF2QQfB_rKDYpadIPZ90iDjUjyugVi66m4-V5/pub'),
+                            ],
+                          ),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+              ],
+            ),
+          ),
+          // High score display in bottom-right
+          Positioned(
+            bottom: isMobile ? 20 : 30,
+            right: isMobile ? 15 : 30,
+            child: buildHighScore(isMobile: isMobile),
+          ),
+        ],
+      ),
+    ),
+  ),
+            if (showRoomSelection || isSearchingForGame)
+              buildRoomSelectionOverlay(isMobile: isMobile),
+            if (showCreateRoom) buildCreateRoomOverlay(isMobile: isMobile),
+            if (showJoinRoom) buildJoinRoomOverlay(isMobile: isMobile),
+            if (gameMode == 'ai')
+              Positioned(
+                top: isMobile ? 20 : 30,
+                right: isMobile ? 15 : 30,
+                child: Material(
+                  color: Colors.transparent,
+                  child: buildDifficultySelector(isMobile: isMobile),
+                ),
               ),
-            // Difficulty selector in the top-right corner (wrapped in Material for pointer events)
             Positioned(
               top: isMobile ? 20 : 30,
-              right: isMobile ? 15 : 30,
+              left: isMobile ? 15 : 30,
               child: Material(
                 color: Colors.transparent,
-                child: buildDifficultySelector(isMobile: isMobile),
+                child: buildVersusButton(isMobile: isMobile),
               ),
             ),
-            // Winstreak in the bottom-right corner (wrapped in Material for pointer events)
+            if ((gameMode == 'ai' || gameMode == 'human') && !showInitialOverlay)
+  Positioned(
+    bottom: isMobile ? 20 : 30,
+    right: isMobile ? 15 : 30,
+    child: Material(
+      color: Colors.transparent,
+      child: buildWinStreak(isMobile: isMobile),
+    ),
+  ),
             Positioned(
-              bottom: isMobile ? 20 : 30,
-              right: isMobile ? 15 : 30,
-              child: Material(
-                color: Colors.transparent,
-                child: buildWinStreak(isMobile: isMobile),
-              ),
+              bottom: isShortScreen ? 30 : (isMobile ? 45 : 65),
+              left: 0,
+              right: 0,
+              child: buildModifierCards(isMobile: isMobile, isSmallPhone: isSmallPhone),
             ),
           ],
         ),
       ),
     );
+  }
+
+// Helper method to get display symbol for modifiers
+  String _getModifierDisplaySymbol(String modifierKey) {
+    switch (modifierKey) {
+      case 'mulligan':
+        return 'M';
+      case '2x':
+        return '2×';
+      case '+3':
+        return '+3';
+      case '-3':
+        return '-3';
+      case '-1':
+        return '-1';
+      case '+1':
+        return '+1';
+      case '+11':
+        return '+11';
+      case 'draw1':
+        return 'D';
+      case '-0.5':
+        return '-½';
+      case 'rewind':
+        return 'R';
+      default:
+        return '?';
+    }
+  }
+
+  Color _getModifierColor(
+      String modifierType, bool used, bool isSelected, bool isDisabled) {
+    if (used) return Colors.grey[800]!;
+    if (isSelected) {
+      return const Color.fromARGB(255, 255, 215, 0); // Gold when selected
+    }
+    if (isDisabled) return Colors.grey[600]!;
+
+    // Unique colors for each modifier type
+    switch (modifierType) {
+      case 'mulligan':
+        return const Color.fromARGB(255, 156, 39, 176); // Purple
+      case '2x':
+        return const Color.fromARGB(255, 239, 15, 255); // Red
+      case '+3':
+        return const Color.fromARGB(255, 76, 175, 80); // Green
+      case '-3':
+        return const Color.fromARGB(255, 121, 8, 0); // Orange
+      case '+1':
+        return const Color.fromARGB(255, 33, 150, 243); // Blue
+      case '-1':
+        return const Color.fromARGB(255, 24, 74, 8); // Amber
+      case '+11':
+        return const Color.fromARGB(255, 103, 58, 183); // Deep Purple
+      case 'draw1':
+        return const Color.fromARGB(255, 0, 150, 136); // Teal
+      case '-0.5':
+        return const Color.fromARGB(255, 121, 85, 72); // Brown
+      case 'rewind':
+        return const Color.fromARGB(255, 19, 73, 98); // Blue Grey
+      default:
+        return const Color.fromARGB(255, 77, 104, 255); // Default blue
+    }
   }
 
   Widget _buildRuleItem(String text) {
@@ -2160,46 +5731,593 @@ class _GameScreenState extends State<GameScreen> {
   }
 }
 
-class AnalogPaperTimer extends StatelessWidget {
+Widget _buildRuleItemWithLink(String text, String url) {
+  return Row(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Container(
+        width: 4,
+        height: 4,
+        margin: const EdgeInsets.only(top: 8, right: 12),
+        decoration: BoxDecoration(
+          color: Colors.indigo.withOpacity(0.8),
+          shape: BoxShape.circle,
+        ),
+      ),
+      Expanded(
+        child: GestureDetector(
+          onTap: () async {
+            final Uri uri = Uri.parse(url);
+            try {
+              await launchUrl(
+                uri,
+                mode: LaunchMode.externalApplication,
+                webOnlyWindowName: '_blank',
+              );
+            } catch (e) {
+              print('Error launching URL: $e');
+            }
+          },
+          child: Text(
+            text,
+            style: TextStyle(
+              color: const Color.fromARGB(255, 100, 181, 246),
+              fontSize: 14,
+              height: 1.4,
+              decoration: TextDecoration.underline,
+            ),
+          ),
+        ),
+      ),
+    ],
+  );
+}
+
+class AnalogPaperTimer extends StatefulWidget {
   final int secondsLeft;
   final int totalSeconds;
+  final double size;
 
   const AnalogPaperTimer({
     super.key,
     required this.secondsLeft,
     required this.totalSeconds,
-    this.size = 90.0, // Add size parameter
+    this.size = 90.0,
   });
 
-  final double size; // Add this field
+  @override
+  State<AnalogPaperTimer> createState() => _AnalogPaperTimerState();
+}
+
+class _AnalogPaperTimerState extends State<AnalogPaperTimer>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
+    );
+    _pulseAnimation = Tween<double>(begin: 1.0, end: 1.08).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+    _updatePulseState();
+  }
+
+  @override
+  void didUpdateWidget(AnalogPaperTimer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _updatePulseState();
+  }
+
+  void _updatePulseState() {
+    if (widget.secondsLeft <= 3 && widget.secondsLeft > 0) {
+      if (!_pulseController.isAnimating) {
+        _pulseController.repeat(reverse: true);
+      }
+    } else {
+      if (_pulseController.isAnimating) {
+        _pulseController.stop();
+        _pulseController.reset();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: size,
-      height: size,
-      child: CustomPaint(
-        size: const Size(90, 90),
-        painter: _PaperTimerPainter(
-          secondsLeft: secondsLeft,
-          totalSeconds: totalSeconds,
+    final bool isUrgent = widget.secondsLeft <= 3 && widget.secondsLeft > 0;
+    
+    return AnimatedBuilder(
+      animation: _pulseAnimation,
+      builder: (context, child) {
+        return Transform.scale(
+          scale: isUrgent ? _pulseAnimation.value : 1.0,
+          child: SizedBox(
+            width: widget.size,
+            height: widget.size,
+            child: CustomPaint(
+              size: Size(widget.size, widget.size),
+              painter: _PaperTimerPainter(
+                secondsLeft: widget.secondsLeft,
+                totalSeconds: widget.totalSeconds,
+                isUrgent: isUrgent,
+              ),
+              child: Center(
+                child: AnimatedDefaultTextStyle(
+                  duration: const Duration(milliseconds: 200),
+                  style: TextStyle(
+                    fontFamily: 'DSEG7Classic',
+                    fontSize: widget.size * 0.30,
+                    color: isUrgent 
+                        ? const Color.fromARGB(255, 200, 60, 60)
+                        : const Color.fromARGB(220, 60, 60, 63),
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.0,
+                    shadows: [
+                      Shadow(
+                        blurRadius: isUrgent ? 8 : 2,
+                        color: isUrgent 
+                            ? const Color.fromARGB(100, 255, 80, 80)
+                            : const Color.fromARGB(61, 90, 90, 90),
+                        offset: const Offset(1, 1),
+                      ),
+                    ],
+                  ),
+                  child: Text(
+                    '${widget.secondsLeft}',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class FloatingPrizeCard extends StatefulWidget {
+  final Widget child;
+  final int index;
+
+  const FloatingPrizeCard({super.key, required this.child, this.index = 0});
+
+  @override
+  State<FloatingPrizeCard> createState() => _FloatingPrizeCardState();
+}
+
+class _FloatingPrizeCardState extends State<FloatingPrizeCard>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _animation;
+  Timer? _animationTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(seconds: 3),
+      vsync: this,
+    );
+
+    _animation = Tween<double>(
+      begin: 0,
+      end: 1.0,
+    ).animate(CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeInOut,
+    ));
+
+    _startAnimationCycle();
+  }
+
+  void _startAnimationCycle() {
+    _controller.repeat(reverse: true);
+
+    _animationTimer = Timer(const Duration(seconds: 4), () {
+      _controller.stop();
+
+      _controller
+          .animateTo(0.0, duration: const Duration(milliseconds: 600))
+          .then((_) {
+        _animationTimer = Timer(const Duration(seconds: 6), () {
+          if (mounted) {
+            _startAnimationCycle();
+          }
+        });
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _animationTimer?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _animation,
+      builder: (context, child) {
+        double phaseOffset = (widget.index * 0.33) % 1.0;
+        double animationValue = _animation.value;
+        double offsetValue = animationValue *
+            sin((animationValue / 4) * 2 * pi + (phaseOffset * 2 * pi)) * 2;
+
+        return Transform.translate(
+          offset: Offset(0, offsetValue),
+          child: widget.child,
+        );
+      },
+    );
+  }
+}
+
+// Animated prize card list that handles additions/removals with flair
+class AnimatedPrizeCardRow extends StatelessWidget {
+  final List<String> prizeCards;
+  final bool isMobile;
+  final bool isTablet;
+  final bool isOpponent;
+
+  const AnimatedPrizeCardRow({
+    super.key,
+    required this.prizeCards,
+    required this.isMobile,
+    required this.isTablet,
+    this.isOpponent = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(
+        prizeCards.length,
+        (index) => _AnimatedPrizeCardItem(
+          key: ValueKey('prize_${isOpponent ? 'opp' : 'player'}_$index'),
+          index: index,
+          isMobile: isMobile,
+          isTablet: isTablet,
         ),
-        child: Center(
-          child: Text(
-            '$secondsLeft',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontFamily: 'Roboto',
-              fontSize: size * 0.4, // Scale with timer size
-              color: Color.fromARGB(220, 60, 60, 63),
-              fontWeight: FontWeight.bold,
-              shadows: [
-                Shadow(
-                  blurRadius: 2,
-                  color: Color.fromARGB(61, 90, 90, 90),
-                  offset: Offset(1, 1),
+      ),
+    );
+  }
+}
+
+class _AnimatedPrizeCardItem extends StatefulWidget {
+  final int index;
+  final bool isMobile;
+  final bool isTablet;
+
+  const _AnimatedPrizeCardItem({
+    super.key,
+    required this.index,
+    required this.isMobile,
+    required this.isTablet,
+  });
+
+  @override
+  State<_AnimatedPrizeCardItem> createState() => _AnimatedPrizeCardItemState();
+}
+
+class _AnimatedPrizeCardItemState extends State<_AnimatedPrizeCardItem>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _entranceController;
+  late Animation<double> _scaleAnimation;
+  late Animation<double> _opacityAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _entranceController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
+    );
+
+    _scaleAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
+      CurvedAnimation(parent: _entranceController, curve: Curves.elasticOut),
+    );
+
+    _opacityAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _entranceController,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+
+    // Staggered entrance
+    Future.delayed(Duration(milliseconds: widget.index * 80), () {
+      if (mounted) {
+        _entranceController.forward();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _entranceController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _entranceController,
+      builder: (context, child) {
+        return Opacity(
+          opacity: _opacityAnimation.value,
+          child: Transform.scale(
+            scale: _scaleAnimation.value,
+            child: Padding(
+              padding: EdgeInsets.symmetric(
+                horizontal: widget.isMobile ? 2.0 : 4.0,
+              ),
+              child: FloatingPrizeCard(
+                index: widget.index,
+                child: Container(
+                  width: widget.isMobile ? 55 : (widget.isTablet ? 55 : 70),
+                  height: widget.isMobile ? 77 : (widget.isTablet ? 77 : 98),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(8),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.4),
+                        blurRadius: 8,
+                        offset: const Offset(2, 4),
+                        spreadRadius: 1,
+                      ),
+                    ],
+                  ),
+                  child: const CardWidget(isCardBack: true),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class AnimatedModifierCard extends StatefulWidget {
+  final String modifierType;
+  final String tooltip;
+  final bool used;
+  final VoidCallback? onTap;
+  final bool isMobile;
+  final bool isSmallPhone;
+  final bool isSelected;
+
+  const AnimatedModifierCard({
+    super.key,
+    required this.modifierType,
+    required this.tooltip,
+    required this.used,
+    this.onTap,
+    required this.isMobile,
+    this.isSmallPhone = false,
+    this.isSelected = false,
+  });
+
+  @override
+  State<AnimatedModifierCard> createState() => _AnimatedModifierCardState();
+}
+
+class _AnimatedModifierCardState extends State<AnimatedModifierCard>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _flipAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
+
+    _flipAnimation = Tween<double>(
+      begin: 0.0,
+      end: 1.0, // This will be 180 degrees (π radians)
+    ).animate(CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeInOut,
+    ));
+
+    // Start the flip animation
+    Future.delayed(Duration(milliseconds: 200), () {
+      if (mounted) {
+        _controller.forward();
+      }
+    });
+  }
+
+  String _getModifierAssetPath(String modifier) {
+    switch (modifier) {
+      case 'rewind':
+        return 'assets/images/rewindmod.png';
+      case 'mulligan':
+        return 'assets/images/mulliganmod.png';
+      case 'draw1':
+        return 'assets/images/draw1mod.png';
+      case '-1':
+        return 'assets/images/-1mod.png';
+      case '-3':
+        return 'assets/images/-3mod.png';
+      case '-0.5':
+        return 'assets/images/-halfmod.png';
+      case '+1':
+        return 'assets/images/+1mod.png';
+      case '+3':
+        return 'assets/images/+3mod.png';
+      case '+11':
+        return 'assets/images/+11mod.png';
+      case '2x':
+        return 'assets/images/2xmod.png';
+      default:
+        return 'assets/images/rewindmod.png'; // fallback
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _flipAnimation,
+      builder: (context, child) {
+        // Show modifier card when animation value > 0.5 (90 degrees)
+        final isShowingFront = _flipAnimation.value > 0.5;
+
+        return Transform(
+          alignment: Alignment.center,
+          transform: Matrix4.identity()
+            ..setEntry(3, 2, 0.001)
+            ..rotateY(
+                _flipAnimation.value * pi), // Only π radians (180 degrees)
+          child: isShowingFront ? _buildFrontCard() : _buildBackCard(),
+        );
+      },
+    );
+  }
+
+  Widget _buildFrontCard() {
+    // Apply the flip transform to show the modifier card correctly
+    return Transform(
+      alignment: Alignment.center,
+      transform: Matrix4.identity()..rotateY(pi),
+      child: _buildModifierCard(),
+    );
+  }
+
+  Widget _buildBackCard() {
+    return Tooltip(
+      message: "Modifier Card",
+      child: Container(
+        width: widget.isSmallPhone ? 40 : (widget.isMobile ? 50 : 60),
+        height: widget.isSmallPhone ? 56 : (widget.isMobile ? 70 : 84),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: const Color.fromARGB(100, 134, 158, 255),
+            width: 2,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.4),
+              blurRadius: 8,
+              offset: const Offset(2, 4),
+              spreadRadius: 1,
+            ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.asset(
+            'assets/images/cardback.png',
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildModifierCard() {
+    bool isDisabled = widget.onTap == null;
+
+    Color borderColor = widget.used
+        ? Colors.grey[600]!
+        : (widget.isSelected
+            ? const Color.fromARGB(247, 0, 255, 229)
+            : (isDisabled
+                ? const Color.fromARGB(100, 134, 158, 255)
+                : const Color.fromARGB(255, 134, 158, 255)));
+
+    return Tooltip(
+      message: widget.used ? '${widget.tooltip} (Used)' : widget.tooltip,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: Opacity(
+          opacity: widget.used ? 0.3 : (isDisabled ? 0.6 : 0.95),
+          child: Container(
+            width: widget.isSmallPhone ? 40 : (widget.isMobile ? 50 : 60),
+            height: widget.isSmallPhone ? 56 : (widget.isMobile ? 70 : 84),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: borderColor,
+                width: widget.isSelected ? 3 : 2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.4),
+                  blurRadius: 8,
+                  offset: const Offset(2, 4),
+                  spreadRadius: 1,
                 ),
               ],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: ColorFiltered(
+                colorFilter: widget.used
+                    ? const ColorFilter.matrix([
+                        0.2126,
+                        0.7152,
+                        0.0722,
+                        0,
+                        0,
+                        0.2126,
+                        0.7152,
+                        0.0722,
+                        0,
+                        0,
+                        0.2126,
+                        0.7152,
+                        0.0722,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                        0,
+                      ])
+                    : (isDisabled
+                        ? ColorFilter.mode(
+                            Colors.grey.withOpacity(0.5),
+                            BlendMode.srcATop,
+                          )
+                        : const ColorFilter.mode(
+                            Colors.transparent,
+                            BlendMode.multiply,
+                          )),
+                child: Image.asset(
+                  _getModifierAssetPath(widget.modifierType),
+                  fit: BoxFit.cover,
+                  width: double.infinity,
+                  height: double.infinity,
+                ),
+              ),
             ),
           ),
         ),
@@ -2208,18 +6326,669 @@ class AnalogPaperTimer extends StatelessWidget {
   }
 }
 
-class _PaperTimerPainter extends CustomPainter {
-  final int secondsLeft;
-  final int totalSeconds;
+// Staggered game over overlay with smooth entrance animations
+class _GameOverOverlay extends StatefulWidget {
+  final String? winner;
+  final bool isMobile;
+  final bool waitingForRematch;
+  final String gameMode;
+  final VoidCallback onNextGame;
+  final VoidCallback onLeaveRoom;
 
-  _PaperTimerPainter({required this.secondsLeft, required this.totalSeconds});
+  const _GameOverOverlay({
+    required this.winner,
+    required this.isMobile,
+    required this.waitingForRematch,
+    required this.gameMode,
+    required this.onNextGame,
+    required this.onLeaveRoom,
+  });
+
+  @override
+  State<_GameOverOverlay> createState() => _GameOverOverlayState();
+}
+
+class _GameOverOverlayState extends State<_GameOverOverlay>
+    with TickerProviderStateMixin {
+  late AnimationController _backdropController;
+  late AnimationController _iconController;
+  late AnimationController _textController;
+  late AnimationController _buttonController;
+
+  late Animation<double> _backdropAnimation;
+  late Animation<double> _iconScaleAnimation;
+  late Animation<double> _iconOpacityAnimation;
+  late Animation<Offset> _textSlideAnimation;
+  late Animation<double> _textOpacityAnimation;
+  late Animation<double> _buttonOpacityAnimation;
+  late Animation<Offset> _buttonSlideAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // Backdrop fade
+    _backdropController = AnimationController(
+      duration: const Duration(milliseconds: 300),
+      vsync: this,
+    );
+    _backdropAnimation = Tween<double>(begin: 0.0, end: 0.75).animate(
+      CurvedAnimation(parent: _backdropController, curve: Curves.easeOut),
+    );
+
+    // Icon scale with subtle bounce
+    _iconController = AnimationController(
+      duration: const Duration(milliseconds: 600),
+      vsync: this,
+    );
+    _iconScaleAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _iconController, curve: Curves.elasticOut),
+    );
+    _iconOpacityAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _iconController,
+        curve: const Interval(0.0, 0.3, curve: Curves.easeOut),
+      ),
+    );
+
+    // Text slide up with fade
+    _textController = AnimationController(
+      duration: const Duration(milliseconds: 400),
+      vsync: this,
+    );
+    _textSlideAnimation = Tween<Offset>(
+      begin: const Offset(0, 0.3),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _textController, curve: Curves.easeOutCubic));
+    _textOpacityAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _textController, curve: Curves.easeOut),
+    );
+
+    // Button fade and slide
+    _buttonController = AnimationController(
+      duration: const Duration(milliseconds: 350),
+      vsync: this,
+    );
+    _buttonOpacityAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _buttonController, curve: Curves.easeOut),
+    );
+    _buttonSlideAnimation = Tween<Offset>(
+      begin: const Offset(0, 0.2),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _buttonController, curve: Curves.easeOutCubic));
+
+    // Start staggered animation sequence
+    _startAnimationSequence();
+  }
+
+  void _startAnimationSequence() async {
+    _backdropController.forward();
+    await Future.delayed(const Duration(milliseconds: 100));
+    _iconController.forward();
+    await Future.delayed(const Duration(milliseconds: 200));
+    _textController.forward();
+    await Future.delayed(const Duration(milliseconds: 150));
+    _buttonController.forward();
+  }
+
+  @override
+  void dispose() {
+    _backdropController.dispose();
+    _iconController.dispose();
+    _textController.dispose();
+    _buttonController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isWin = widget.winner == 'player';
+    final accentColor = isWin ? Colors.greenAccent : Colors.redAccent;
+
+    return AnimatedBuilder(
+      animation: Listenable.merge([
+        _backdropAnimation,
+        _iconScaleAnimation,
+        _textSlideAnimation,
+        _buttonOpacityAnimation,
+      ]),
+      builder: (context, child) {
+        return Container(
+          color: Colors.black.withOpacity(_backdropAnimation.value),
+          child: Stack(
+            children: [
+              Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    // Animated Icon
+                    Opacity(
+                      opacity: _iconOpacityAnimation.value,
+                      child: Transform.scale(
+                        scale: _iconScaleAnimation.value,
+                        child: Icon(
+                          isWin ? Icons.diamond_sharp : Icons.heart_broken,
+                          size: 120,
+                          color: accentColor,
+                          shadows: [
+                            Shadow(blurRadius: 16, color: accentColor),
+                            Shadow(blurRadius: 32, color: accentColor.withOpacity(0.5)),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    // Animated Text
+                    SlideTransition(
+                      position: _textSlideAnimation,
+                      child: FadeTransition(
+                        opacity: _textOpacityAnimation,
+                        child: Text(
+                          isWin ? 'Victory!' : 'Game Over!',
+                          style: TextStyle(
+                            color: accentColor,
+                            fontSize: 48,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1.5,
+                            shadows: [
+                              Shadow(blurRadius: 12, color: accentColor),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: widget.isMobile ? 16 : 32),
+                    // Animated Button
+                    SlideTransition(
+                      position: _buttonSlideAnimation,
+                      child: FadeTransition(
+                        opacity: _buttonOpacityAnimation,
+                        child: _AnimatedPressButton(
+                          waitingForRematch: widget.waitingForRematch,
+                          onPressed: widget.waitingForRematch ? null : widget.onNextGame,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // Exit button for multiplayer
+              if (widget.gameMode == 'human')
+                Positioned(
+                  left: 16,
+                  bottom: 16,
+                  child: FadeTransition(
+                    opacity: _buttonOpacityAnimation,
+                    child: IconButton(
+                      icon: const Icon(Icons.exit_to_app),
+                      iconSize: 25,
+                      color: Colors.white60,
+                      tooltip: 'Back to Single Player',
+                      onPressed: widget.onLeaveRoom,
+                      style: IconButton.styleFrom(
+                        backgroundColor: Colors.black.withOpacity(0.3),
+                        padding: const EdgeInsets.all(10),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+// Animated press button with micro-interaction
+class _AnimatedPressButton extends StatefulWidget {
+  final bool waitingForRematch;
+  final VoidCallback? onPressed;
+
+  const _AnimatedPressButton({
+    required this.waitingForRematch,
+    this.onPressed,
+  });
+
+  @override
+  State<_AnimatedPressButton> createState() => _AnimatedPressButtonState();
+}
+
+class _AnimatedPressButtonState extends State<_AnimatedPressButton>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _pressController;
+  late Animation<double> _scaleAnimation;
+  bool _isPressed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _pressController = AnimationController(
+      duration: const Duration(milliseconds: 100),
+      vsync: this,
+    );
+    _scaleAnimation = Tween<double>(begin: 1.0, end: 0.95).animate(
+      CurvedAnimation(parent: _pressController, curve: Curves.easeInOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _pressController.dispose();
+    super.dispose();
+  }
+
+  void _handleTapDown(TapDownDetails details) {
+    if (widget.onPressed != null) {
+      setState(() => _isPressed = true);
+      _pressController.forward();
+    }
+  }
+
+  void _handleTapUp(TapUpDetails details) {
+    if (_isPressed) {
+      _pressController.reverse();
+      setState(() => _isPressed = false);
+    }
+  }
+
+  void _handleTapCancel() {
+    if (_isPressed) {
+      _pressController.reverse();
+      setState(() => _isPressed = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTapDown: _handleTapDown,
+      onTapUp: _handleTapUp,
+      onTapCancel: _handleTapCancel,
+      child: AnimatedBuilder(
+        animation: _scaleAnimation,
+        builder: (context, child) {
+          return Transform.scale(
+            scale: _scaleAnimation.value,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: widget.waitingForRematch
+                    ? Colors.grey[700]
+                    : const Color.fromARGB(255, 77, 104, 255),
+                foregroundColor: Colors.white,
+                disabledBackgroundColor: const Color.fromARGB(240, 97, 97, 97),
+                disabledForegroundColor: const Color.fromARGB(255, 230, 230, 230),
+                padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 14),
+                elevation: _isPressed ? 2 : 6,
+              ),
+              onPressed: widget.onPressed,
+              child: Text(
+                widget.waitingForRematch ? 'Waiting for opponent...' : 'Next Game',
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+// Turn indicator with subtle pulsing glow
+class _TurnIndicatorContainer extends StatefulWidget {
+  final bool isPlayerTurn;
+  final Widget child;
+
+  const _TurnIndicatorContainer({
+    required this.isPlayerTurn,
+    required this.child,
+  });
+
+  @override
+  State<_TurnIndicatorContainer> createState() => _TurnIndicatorContainerState();
+}
+
+class _TurnIndicatorContainerState extends State<_TurnIndicatorContainer>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _glowController;
+  late Animation<double> _glowAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _glowController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+    _glowAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _glowController, curve: Curves.easeInOut),
+    );
+    
+    if (widget.isPlayerTurn) {
+      _glowController.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void didUpdateWidget(_TurnIndicatorContainer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isPlayerTurn && !oldWidget.isPlayerTurn) {
+      // Just became player's turn - start glow
+      _glowController.forward(from: 0.0);
+      _glowController.repeat(reverse: true);
+    } else if (!widget.isPlayerTurn && oldWidget.isPlayerTurn) {
+      // No longer player's turn - fade out
+      _glowController.stop();
+      _glowController.reverse();
+    }
+  }
+
+  @override
+  void dispose() {
+    _glowController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _glowAnimation,
+      builder: (context, child) {
+        final glowOpacity = widget.isPlayerTurn ? 0.04 + (_glowAnimation.value * 0.08) : 0.0;
+        final blurRadius = widget.isPlayerTurn ? 16 + (_glowAnimation.value * 12) : 0.0;
+        
+        return Container(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: widget.isPlayerTurn
+                ? [
+                    BoxShadow(
+                      color: const Color.fromARGB(255, 100, 180, 255)
+                          .withOpacity(glowOpacity),
+                      blurRadius: blurRadius,
+                      spreadRadius: 2 + (_glowAnimation.value * 4),
+                    ),
+                  ]
+                : null,
+          ),
+          child: widget.child,
+        );
+      },
+    );
+  }
+}
+
+// Animated play button with press effect
+class _PlayButton extends StatefulWidget {
+  final bool canPlay;
+  final VoidCallback? onPressed;
+  final bool isMobile;
+  final bool isTablet;
+  final bool isSmallPhone;
+
+  const _PlayButton({
+    required this.canPlay,
+    this.onPressed,
+    required this.isMobile,
+    required this.isTablet,
+    this.isSmallPhone = false,
+  });
+
+  @override
+  State<_PlayButton> createState() => _PlayButtonState();
+}
+
+class _PlayButtonState extends State<_PlayButton>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _scaleAnimation;
+  late Animation<double> _glowAnimation;
+  bool _isPressed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 100),
+      vsync: this,
+    );
+    _scaleAnimation = Tween<double>(begin: 1.0, end: 0.92).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+    );
+    _glowAnimation = Tween<double>(begin: 8.0, end: 2.0).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _handleTapDown(TapDownDetails details) {
+    if (widget.canPlay) {
+      setState(() => _isPressed = true);
+      _controller.forward();
+    }
+  }
+
+  void _handleTapUp(TapUpDetails details) {
+    if (_isPressed) {
+      _controller.reverse();
+      setState(() => _isPressed = false);
+    }
+  }
+
+  void _handleTapCancel() {
+    if (_isPressed) {
+      _controller.reverse();
+      setState(() => _isPressed = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTapDown: _handleTapDown,
+      onTapUp: _handleTapUp,
+      onTapCancel: _handleTapCancel,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, child) {
+          return Transform.scale(
+            scale: _scaleAnimation.value,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 150),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                boxShadow: widget.canPlay
+                    ? [
+                        BoxShadow(
+                          color: const Color.fromARGB(255, 123, 207, 255)
+                              .withOpacity(_isPressed ? 0.3 : 0.6),
+                          blurRadius: _glowAnimation.value,
+                          spreadRadius: _isPressed ? 0 : 2,
+                        ),
+                      ]
+                    : null,
+              ),
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: widget.canPlay
+                      ? const Color.fromARGB(30, 100, 180, 255)
+                      : const Color.fromARGB(5, 194, 194, 194),
+                  shape: const CircleBorder(),
+                  padding: EdgeInsets.all(widget.isSmallPhone ? 8 : (widget.isMobile ? 12 : 18)),
+                  elevation: _isPressed ? 2 : 8,
+                  shadowColor: const Color.fromARGB(255, 123, 207, 255),
+                ),
+                onPressed: widget.onPressed,
+                child: Text(
+                  '=',
+                  style: TextStyle(
+                    fontFamily: 'Courier',
+                    fontSize: widget.isSmallPhone ? 32 : (widget.isMobile ? 46 : (widget.isTablet ? 32 : 36)),
+                    color: widget.canPlay
+                        ? const Color.fromARGB(255, 237, 227, 240)
+                        : const Color.fromARGB(100, 237, 227, 240),
+                    fontWeight: FontWeight.bold,
+                    shadows: [
+                      Shadow(
+                        blurRadius: widget.canPlay ? 8 : 4,
+                        color: widget.canPlay
+                            ? const Color.fromARGB(222, 219, 242, 255)
+                            : const Color.fromARGB(100, 219, 242, 255),
+                        offset: const Offset(0, 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+// Searching animation for quick match
+class _SearchingAnimation extends StatefulWidget {
+  const _SearchingAnimation();
+
+  @override
+  State<_SearchingAnimation> createState() => _SearchingAnimationState();
+}
+
+class _SearchingAnimationState extends State<_SearchingAnimation>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _rotationAnimation;
+  late Animation<double> _pulseAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 2000),
+      vsync: this,
+    )..repeat();
+
+    _rotationAnimation = Tween<double>(begin: 0, end: 2 * pi).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.linear),
+    );
+
+    _pulseAnimation = Tween<double>(begin: 0.9, end: 1.1).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: const Interval(0.0, 0.5, curve: Curves.easeInOut),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        return SizedBox(
+          width: 80,
+          height: 80,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // Outer rotating ring
+              Transform.rotate(
+                angle: _rotationAnimation.value,
+                child: Container(
+                  width: 70,
+                  height: 70,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: const Color.fromARGB(255, 76, 175, 80).withOpacity(0.3),
+                      width: 3,
+                    ),
+                  ),
+                  child: CustomPaint(
+                    painter: _SearchArcPainter(
+                      progress: _rotationAnimation.value / (2 * pi),
+                    ),
+                  ),
+                ),
+              ),
+              // Center icon with pulse
+              Transform.scale(
+                scale: _pulseAnimation.value,
+                child: const Icon(
+                  Icons.flash_on,
+                  size: 32,
+                  color: Color.fromARGB(255, 76, 175, 80),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SearchArcPainter extends CustomPainter {
+  final double progress;
+
+  _SearchArcPainter({required this.progress});
 
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = const Color.fromARGB(57, 67, 67, 71)
-      ..strokeWidth =
-          4 // thinner arc
+      ..color = const Color.fromARGB(255, 76, 175, 80)
+      ..strokeWidth = 3
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+
+    final rect = Rect.fromCircle(
+      center: size.center(Offset.zero),
+      radius: size.width / 2 - 2,
+    );
+
+    // Draw arc that represents searching progress
+    canvas.drawArc(rect, -pi / 2, pi * 0.7, false, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SearchArcPainter oldDelegate) =>
+      oldDelegate.progress != progress;
+}
+
+class _PaperTimerPainter extends CustomPainter {
+  final int secondsLeft;
+  final int totalSeconds;
+  final bool isUrgent;
+
+  _PaperTimerPainter({
+    required this.secondsLeft,
+    required this.totalSeconds,
+    this.isUrgent = false,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = isUrgent 
+          ? const Color.fromARGB(120, 200, 60, 60)
+          : const Color.fromARGB(47, 67, 67, 71)
+      ..strokeWidth = isUrgent ? 5 : 4
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
@@ -2228,8 +6997,8 @@ class _PaperTimerPainter extends CustomPainter {
     canvas.drawArc(
       Rect.fromCircle(
         center: size.center(Offset.zero),
-        radius: size.width / 2 - 18,
-      ), // further from center
+        radius: size.width / 2 - 8,
+      ),
       -pi / 2,
       sweepAngle,
       false,
@@ -2238,5 +7007,7 @@ class _PaperTimerPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant _PaperTimerPainter oldDelegate) => 
+      oldDelegate.secondsLeft != secondsLeft || 
+      oldDelegate.isUrgent != isUrgent;
 }
