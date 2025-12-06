@@ -51,6 +51,5 @@ android/local.properties
 *.jks
 
 # Firebase config (contains API keys)
-# Uncomment if you want to keep this private:
-# android/app/google-services.json
-# ios/Runner/GoogleService-Info.plist
+android/app/google-services.json
+ios/Runner/GoogleService-Info.plist
