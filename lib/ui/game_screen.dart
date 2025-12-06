@@ -68,6 +68,8 @@ class _GameScreenState extends State<GameScreen> {
   bool isPlayerTurn = true;
   bool gameOver = false;
   bool showInitialOverlay = true;
+  int _gameSessionId = 0; // Increments when a new game starts, used for prize card animations
+  bool _showPrizeWinShine = false; // Triggers shine animation when prize is won
   bool showRules = false;
   bool _waitingForRematch = false;
   bool _aceDialogOpen = false;
@@ -259,6 +261,8 @@ void _checkAndUpdateHighScore() {
 
 // Quick Match - Search for an open game or create one
   Future<void> _searchForGame() async {
+    print('DEBUG: _searchForGame() called');
+    
     // Light preparation - don't use _prepareForMultiplayer() as it resets too much
     turnTimer?.cancel();
     gameSubscription?.cancel();
@@ -279,65 +283,77 @@ void _checkAndUpdateHighScore() {
 
     try {
       _generatePlayerId();
+      print('DEBUG: Generated player ID: $playerId');
       
-      // Query for any room that is waiting and is a quick match room
+      // Query specifically for quick match rooms (not room-code rooms)
       final DatabaseReference roomsRef = FirebaseDatabase.instance.ref('rooms');
+      print('DEBUG: Querying Firebase for quick match rooms...');
+      
       final snapshot = await roomsRef
-          .orderByChild('gameState')
-          .equalTo('waiting')
-          .limitToFirst(10)
+          .orderByChild('isQuickMatch')
+          .equalTo(true)
+          .limitToFirst(20)
           .get();
+
+      print('DEBUG: Firebase query complete. Exists: ${snapshot.exists}');
 
       String? foundRoomCode;
       
       if (snapshot.exists) {
         final rooms = snapshot.value as Map<dynamic, dynamic>;
+        print('DEBUG: Found ${rooms.length} quick match rooms');
         final now = DateTime.now().millisecondsSinceEpoch;
         
-        // Find a suitable quick match room (not our own, not too old)
+        // Find a suitable quick match room that's waiting for opponent
         for (var entry in rooms.entries) {
           final roomData = entry.value as Map<dynamic, dynamic>;
-          final isQuickMatch = roomData['isQuickMatch'] as bool? ?? false;
+          final gameState = roomData['gameState'] as String?;
           final createdAt = roomData['createdAt'] as int? ?? 0;
           final host = roomData['host'] as String?;
           final players = roomData['players'] as Map<dynamic, dynamic>? ?? {};
           
-          // Room must be: quick match, less than 2 minutes old, has 1 player, not ours
+          print('DEBUG: Checking room ${entry.key}: gameState=$gameState, players=${players.length}, host=$host');
+          
+          // Room must be: waiting state, less than 2 minutes old, has 1 player, not ours
+          final isWaiting = gameState == 'waiting';
           final isRecent = (now - createdAt) < 120000; // 2 minutes
           final hasOnePlayer = players.length == 1;
           final isNotOurs = host != playerId;
           
-          if (isQuickMatch && isRecent && hasOnePlayer && isNotOurs) {
+          if (isWaiting && isRecent && hasOnePlayer && isNotOurs) {
             foundRoomCode = entry.key as String;
+            print('DEBUG: Found suitable room: $foundRoomCode');
             break;
           }
         }
+      } else {
+        print('DEBUG: No quick match rooms found in Firebase');
       }
 
       if (foundRoomCode != null) {
         // Found an open room - join it
-        print('DEBUG: Found quick match room: $foundRoomCode');
+        print('DEBUG: Joining quick match room: $foundRoomCode');
         await _joinQuickMatchRoom(foundRoomCode);
       } else {
-        // No room found - create one
-        print('DEBUG: No quick match room found, creating one');
+        // No room found - create one and wait
+        print('DEBUG: Creating new quick match room');
         await _createQuickMatchRoom();
       }
-    } catch (e) {
-      print('Error in quick match: $e');
-      setState(() {
-        connectionStatus = 'Error finding game: $e';
-        isSearchingForGame = false;
-      });
-      _resetToAIMode();
+    } catch (e, stackTrace) {
+      print('ERROR in quick match: $e');
+      print('Stack trace: $stackTrace');
+      // Show error in the Versus Mode modal so user can try again
+      _resetToAIMode(showError: true, errorMessage: 'Connection error. Please try again.');
     }
   }
 
   Future<void> _createQuickMatchRoom() async {
+    print('DEBUG: _createQuickMatchRoom() called');
     try {
       roomCode = _generateRoomCode();
       isHost = true;
       gameMode = 'human';
+      print('DEBUG: Creating room: $roomCode');
 
       final DatabaseReference roomRef =
           FirebaseDatabase.instance.ref('rooms/$roomCode');
@@ -362,20 +378,22 @@ void _checkAndUpdateHighScore() {
         'modifierAssignments': {},
       });
 
+      print('DEBUG: Room $roomCode created successfully. Listening for opponent...');
+      
       setState(() {
         waitingForOpponent = true;
+        isSearchingForGame = true; // Keep this true while waiting
         showInitialOverlay = false; // Ensure Play button overlay is hidden
         connectionStatus = 'Waiting for opponent...';
       });
 
       _listenToRoom();
-    } catch (e) {
-      print('Error creating quick match room: $e');
-      setState(() {
-        connectionStatus = 'Error creating game: $e';
-        isSearchingForGame = false;
-      });
-      _resetToAIMode();
+      print('DEBUG: Now listening to room $roomCode');
+    } catch (e, stackTrace) {
+      print('ERROR creating quick match room: $e');
+      print('Stack trace: $stackTrace');
+      // Show error in the Versus Mode modal so user can try again
+      _resetToAIMode(showError: true, errorMessage: 'Error creating game. Please try again.');
     }
   }
 
@@ -439,11 +457,15 @@ void _checkAndUpdateHighScore() {
   }
 
   void _cancelQuickMatch() {
+    print('DEBUG: _cancelQuickMatch() called');
     quickMatchSubscription?.cancel();
     quickMatchSubscription = null;
+    gameSubscription?.cancel();
+    gameSubscription = null;
     
     // If we created a room, delete it
     if (isHost && roomCode != null) {
+      print('DEBUG: Deleting room $roomCode');
       FirebaseDatabase.instance.ref('rooms/$roomCode').remove();
     }
     
@@ -452,9 +474,10 @@ void _checkAndUpdateHighScore() {
       waitingForOpponent = false;
       connectionStatus = '';
       roomCode = null;
+      // Go back to Versus Mode modal
+      showRoomSelection = true;
+      gameMode = 'ai';
     });
-    
-    _resetToAIMode();
   }
 
 // Update your _createRoom method
@@ -502,8 +525,9 @@ void _checkAndUpdateHighScore() {
     } catch (e) {
       setState(() {
         connectionStatus = 'Error creating room: $e';
+        // Stay in create room modal so user can try again
+        showCreateRoom = true;
       });
-      _resetToAIMode();
     }
   }
 
@@ -525,8 +549,10 @@ void _checkAndUpdateHighScore() {
       if (!snapshot.exists) {
         setState(() {
           connectionStatus = 'Room not found';
+          // Stay in join room modal so user can try again
+          showJoinRoom = true;
+          showRoomSelection = false;
         });
-        _resetToAIMode();
         return;
       }
 
@@ -536,8 +562,10 @@ void _checkAndUpdateHighScore() {
       if (players.length >= 2) {
         setState(() {
           connectionStatus = 'Room is full';
+          // Stay in join room modal so user can try again
+          showJoinRoom = true;
+          showRoomSelection = false;
         });
-        _resetToAIMode();
         return;
       }
 
@@ -561,25 +589,32 @@ void _checkAndUpdateHighScore() {
     } catch (e) {
       setState(() {
         connectionStatus = 'Error joining room: $e';
+        // Stay in join room modal so user can try again
+        showJoinRoom = true;
+        showRoomSelection = false;
       });
-      _resetToAIMode();
     }
   }
 
 // Add this helper method to safely return to AI mode on errors
-  void _resetToAIMode() {
+  void _resetToAIMode({bool showError = false, String errorMessage = ''}) {
     setState(() {
       gameMode = 'ai';
-      showRoomSelection = false;
+      isSearchingForGame = false;
+      waitingForOpponent = false;
       showCreateRoom = false;
       showJoinRoom = false;
-      connectionStatus = '';
-    });
-
-    // Set up a fresh AI game
-    Future.delayed(const Duration(milliseconds: 500), () {
-      if (mounted && gameMode == 'ai') {
-        _setupGame();
+      
+      if (showError && errorMessage.isNotEmpty) {
+        // Show the Versus Mode modal with error message
+        showRoomSelection = true;
+        showInitialOverlay = false;
+        connectionStatus = errorMessage;
+      } else {
+        // Return to initial state
+        showRoomSelection = false;
+        showInitialOverlay = true;
+        connectionStatus = '';
       }
     });
   }
@@ -631,6 +666,7 @@ void _checkAndUpdateHighScore() {
               isSearchingForGame = false;
               showInitialOverlay = false;
               showCreateRoom = false;
+              _gameSessionId++; // Trigger prize card entrance animation for multiplayer
             });
           }
           _updateGameFromFirebase(data);
@@ -2374,10 +2410,11 @@ Widget buildHighScore({required bool isMobile}) {
   }
 
   void _setupGame() {
-    // Rotate to next background
+    // Rotate to next background and increment game session for animations
     setState(() {
       currentBackgroundIndex =
           (currentBackgroundIndex + 1) % backgrounds.length;
+      _gameSessionId++; // Trigger prize card entrance animation
     });
     try {
       fullDeck = _createFullDeck();
@@ -3422,6 +3459,17 @@ Widget buildHighScore({required bool isMobile}) {
         playerPrizeCards.removeLast();
         print('Point won! Remaining: ${playerPrizeCards.length}');
         playPrizeCardSound();
+        // Trigger shine animation on winning card
+        setState(() {
+          _showPrizeWinShine = true;
+        });
+        Future.delayed(const Duration(milliseconds: 800), () {
+          if (mounted) {
+            setState(() {
+              _showPrizeWinShine = false;
+            });
+          }
+        });
       }
       safeDrawCards(playerHand, playerDrawPile, 2);
       playerMaxHandSize = 2;
@@ -4543,7 +4591,7 @@ Widget buildHighScore({required bool isMobile}) {
         const Text(
           'Quick Play',
           style: TextStyle(
-            color: Color.fromARGB(255, 76, 175, 80),
+            color: Color.fromARGB(255, 0, 188, 212),
             fontSize: 24,
             fontWeight: FontWeight.bold,
           ),
@@ -4637,7 +4685,8 @@ Widget buildHighScore({required bool isMobile}) {
     final modalMaxWidth = MediaQuery.of(context).size.width - 40;
     return Positioned.fill(
       child: Container(
-        color: Colors.black.withOpacity(0.8),
+        // Use fully opaque background when searching to hide card animations
+        color: Colors.black.withOpacity(isSearchingForGame ? 1.0 : 0.8),
         child: Center(
           child: Container(
             constraints: BoxConstraints(maxWidth: (isMobile ? 300.0 : 400.0).clamp(0, modalMaxWidth)),
@@ -4687,7 +4736,7 @@ Widget buildHighScore({required bool isMobile}) {
                 // Quick Play - Primary action
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color.fromARGB(255, 76, 175, 80),
+                    backgroundColor: const Color.fromARGB(255, 0, 188, 212),
                     foregroundColor: Colors.white,
                     minimumSize: const Size(double.infinity, 52),
                     elevation: 4,
@@ -5066,54 +5115,44 @@ Widget buildHighScore({required bool isMobile}) {
                             buildOpponentModifierDisplay(isMobile: isMobile),
 
                             SizedBox(height: verticalSpacingSmall),
-// Opponent prize cards (top) - with animated transitions
-                            AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 300),
-                              transitionBuilder: (child, animation) {
-                                return FadeTransition(
-                                  opacity: animation,
-                                  child: child,
-                                );
-                              },
-                              child: Row(
-                                key: ValueKey<int>(opponentPrizeCards.length),
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: List.generate(
-                                  opponentPrizeCards.length,
-                                  (index) => TweenAnimationBuilder<double>(
-                                    key: ValueKey('opp_prize_$index'),
-                                    tween: Tween(begin: 0.8, end: 1.0),
-                                    duration: Duration(milliseconds: 300 + index * 50),
-                                    curve: Curves.elasticOut,
-                                    builder: (context, scale, child) {
-                                      return Transform.scale(
-                                        scale: scale,
-                                        child: child,
-                                      );
-                                    },
-                                    child: Padding(
-                                      padding: EdgeInsets.symmetric(
-                                        horizontal: horizontalCardSpacing / 2,
-                                      ),
-                                      child: FloatingPrizeCard(
-                                        index: index,
-                                        child: Container(
-                                          width: prizeCardWidth,
-                                          height: prizeCardHeight,
-                                          decoration: BoxDecoration(
-                                            borderRadius: BorderRadius.circular(8),
-                                            boxShadow: [
-                                              BoxShadow(
-                                                color:
-                                                    Colors.black.withOpacity(0.4),
-                                                blurRadius: 8,
-                                                offset: const Offset(2, 4),
-                                                spreadRadius: 1,
-                                              ),
-                                            ],
-                                          ),
-                                          child: const CardWidget(isCardBack: true),
+// Opponent prize cards (top) - animate only when a new game starts (keyed by session ID)
+                            Row(
+                              key: ValueKey<String>('opp_prize_${opponentPrizeCards.length}_$_gameSessionId'),
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: List.generate(
+                                opponentPrizeCards.length,
+                                (index) => TweenAnimationBuilder<double>(
+                                  key: ValueKey('opp_prize_${_gameSessionId}_$index'),
+                                  tween: Tween(begin: 0.8, end: 1.0),
+                                  duration: Duration(milliseconds: 300 + index * 50),
+                                  curve: Curves.elasticOut,
+                                  builder: (context, scale, child) {
+                                    return Transform.scale(
+                                      scale: scale,
+                                      child: child,
+                                    );
+                                  },
+                                  child: Padding(
+                                    padding: EdgeInsets.symmetric(
+                                      horizontal: horizontalCardSpacing / 2,
+                                    ),
+                                    child: FloatingPrizeCard(
+                                      index: index,
+                                      child: Container(
+                                        width: prizeCardWidth,
+                                        height: prizeCardHeight,
+                                        decoration: BoxDecoration(
+                                          borderRadius: BorderRadius.circular(8),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: Colors.black.withOpacity(0.4),
+                                              blurRadius: 8,
+                                              offset: const Offset(2, 4),
+                                              spreadRadius: 1,
+                                            ),
+                                          ],
                                         ),
+                                        child: const CardWidget(isCardBack: true),
                                       ),
                                     ),
                                   ),
@@ -5222,44 +5261,57 @@ Widget buildHighScore({required bool isMobile}) {
                                         )
                                       : const SizedBox.shrink(),
                                 ),
-                                AnimatedSwitcher(
-                                  duration: const Duration(milliseconds: 330),
-                                  transitionBuilder: (Widget child,
-                                      Animation<double> animation) {
-                                    return FadeTransition(
-                                      opacity: animation,
-                                      child: ScaleTransition(
-                                        scale:
-                                            Tween<double>(begin: 0.95, end: 1.0)
-                                                .animate(animation),
-                                        child: child,
-                                      ),
-                                    );
-                                  },
-                                  child: field.isNotEmpty
-                                      ? Container(
-                                          key: ValueKey(field.last),
+                                Stack(
+                                  clipBehavior: Clip.none,
+                                  children: [
+                                    AnimatedSwitcher(
+                                      duration: const Duration(milliseconds: 330),
+                                      transitionBuilder: (Widget child,
+                                          Animation<double> animation) {
+                                        return FadeTransition(
+                                          opacity: animation,
+                                          child: ScaleTransition(
+                                            scale:
+                                                Tween<double>(begin: 0.95, end: 1.0)
+                                                    .animate(animation),
+                                            child: child,
+                                          ),
+                                        );
+                                      },
+                                      child: field.isNotEmpty
+                                          ? Container(
+                                              key: ValueKey(field.last),
+                                              width: fieldCardWidth,
+                                              height: fieldCardHeight,
+                                              decoration: BoxDecoration(
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                                boxShadow: [
+                                                  BoxShadow(
+                                                    color: Colors.black
+                                                        .withOpacity(0.4),
+                                                    blurRadius: 8,
+                                                    offset: const Offset(2, 4),
+                                                    spreadRadius: 1,
+                                                  ),
+                                                ],
+                                              ),
+                                              child: CardWidget(
+                                                value: field.last,
+                                                isJoker: field.last == 'jkr',
+                                              ),
+                                            )
+                                          : const SizedBox.shrink(),
+                                    ),
+                                    // Prize win shine animation
+                                    if (_showPrizeWinShine && field.isNotEmpty)
+                                      Positioned.fill(
+                                        child: _PrizeWinShine(
                                           width: fieldCardWidth,
                                           height: fieldCardHeight,
-                                          decoration: BoxDecoration(
-                                            borderRadius:
-                                                BorderRadius.circular(8),
-                                            boxShadow: [
-                                              BoxShadow(
-                                                color: Colors.black
-                                                    .withOpacity(0.4),
-                                                blurRadius: 8,
-                                                offset: const Offset(2, 4),
-                                                spreadRadius: 1,
-                                              ),
-                                            ],
-                                          ),
-                                          child: CardWidget(
-                                            value: field.last,
-                                            isJoker: field.last == 'jkr',
-                                          ),
-                                        )
-                                      : const SizedBox.shrink(),
+                                        ),
+                                      ),
+                                  ],
                                 ),
                                 Expanded(
                                   flex: isMobile ? 1 : 2,
@@ -5355,54 +5407,44 @@ Widget buildHighScore({required bool isMobile}) {
                               ),
                             ),
                             SizedBox(height: verticalSpacingSmall),
-// Player prize cards - with animated transitions  
-                            AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 300),
-                              transitionBuilder: (child, animation) {
-                                return FadeTransition(
-                                  opacity: animation,
-                                  child: child,
-                                );
-                              },
-                              child: Row(
-                                key: ValueKey<int>(playerPrizeCards.length),
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: List.generate(
-                                  playerPrizeCards.length,
-                                  (index) => TweenAnimationBuilder<double>(
-                                    key: ValueKey('player_prize_$index'),
-                                    tween: Tween(begin: 0.8, end: 1.0),
-                                    duration: Duration(milliseconds: 300 + index * 50),
-                                    curve: Curves.elasticOut,
-                                    builder: (context, scale, child) {
-                                      return Transform.scale(
-                                        scale: scale,
-                                        child: child,
-                                      );
-                                    },
-                                    child: Padding(
-                                      padding: EdgeInsets.symmetric(
-                                        horizontal: horizontalCardSpacing / 2,
-                                      ),
-                                      child: FloatingPrizeCard(
-                                        index: index,
-                                        child: Container(
-                                          width: prizeCardWidth,
-                                          height: prizeCardHeight,
-                                          decoration: BoxDecoration(
-                                            borderRadius: BorderRadius.circular(8),
-                                            boxShadow: [
-                                              BoxShadow(
-                                                color:
-                                                    Colors.black.withOpacity(0.4),
-                                                blurRadius: 8,
-                                                offset: const Offset(2, 4),
-                                                spreadRadius: 1,
-                                              ),
-                                            ],
-                                          ),
-                                          child: const CardWidget(isCardBack: true),
+// Player prize cards - animate only when a new game starts (keyed by session ID)
+                            Row(
+                              key: ValueKey<String>('player_prize_${playerPrizeCards.length}_$_gameSessionId'),
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: List.generate(
+                                playerPrizeCards.length,
+                                (index) => TweenAnimationBuilder<double>(
+                                  key: ValueKey('player_prize_${_gameSessionId}_$index'),
+                                  tween: Tween(begin: 0.8, end: 1.0),
+                                  duration: Duration(milliseconds: 300 + index * 50),
+                                  curve: Curves.elasticOut,
+                                  builder: (context, scale, child) {
+                                    return Transform.scale(
+                                      scale: scale,
+                                      child: child,
+                                    );
+                                  },
+                                  child: Padding(
+                                    padding: EdgeInsets.symmetric(
+                                      horizontal: horizontalCardSpacing / 2,
+                                    ),
+                                    child: FloatingPrizeCard(
+                                      index: index,
+                                      child: Container(
+                                        width: prizeCardWidth,
+                                        height: prizeCardHeight,
+                                        decoration: BoxDecoration(
+                                          borderRadius: BorderRadius.circular(8),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: Colors.black.withOpacity(0.4),
+                                              blurRadius: 8,
+                                              offset: const Offset(2, 4),
+                                              spreadRadius: 1,
+                                            ),
+                                          ],
                                         ),
+                                        child: const CardWidget(isCardBack: true),
                                       ),
                                     ),
                                   ),
@@ -6916,7 +6958,7 @@ class _SearchingAnimationState extends State<_SearchingAnimation>
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
                     border: Border.all(
-                      color: const Color.fromARGB(255, 76, 175, 80).withOpacity(0.3),
+                      color: const Color.fromARGB(255, 0, 188, 212).withOpacity(0.3),
                       width: 3,
                     ),
                   ),
@@ -6933,7 +6975,7 @@ class _SearchingAnimationState extends State<_SearchingAnimation>
                 child: const Icon(
                   Icons.flash_on,
                   size: 32,
-                  color: Color.fromARGB(255, 76, 175, 80),
+                  color: Color.fromARGB(255, 0, 188, 212),
                 ),
               ),
             ],
@@ -6944,6 +6986,117 @@ class _SearchingAnimationState extends State<_SearchingAnimation>
   }
 }
 
+// Shine animation that plays when a prize card is won
+class _PrizeWinShine extends StatefulWidget {
+  final double width;
+  final double height;
+
+  const _PrizeWinShine({
+    required this.width,
+    required this.height,
+  });
+
+  @override
+  State<_PrizeWinShine> createState() => _PrizeWinShineState();
+}
+
+class _PrizeWinShineState extends State<_PrizeWinShine>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _shinePosition;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 750), // Slightly slower for visibility
+      vsync: this,
+    );
+
+    _shinePosition = Tween<double>(begin: -0.5, end: 1.5).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeOut),
+    );
+
+    _controller.forward();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: SizedBox(
+            width: widget.width,
+            height: widget.height,
+            child: CustomPaint(
+              painter: _ShinePainter(position: _shinePosition.value),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _ShinePainter extends CustomPainter {
+  final double position;
+
+  _ShinePainter({required this.position});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final shineWidth = size.width * 0.6; // Wider shine
+    final shineCenter = size.width * position;
+
+    final paint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
+        colors: [
+          Colors.transparent,
+          Colors.white.withOpacity(0.1),
+          Colors.white.withOpacity(0.8),  // Brighter
+          Colors.yellow.withOpacity(0.6), // More golden
+          Colors.white.withOpacity(0.8),  // Brighter
+          Colors.white.withOpacity(0.1),
+          Colors.transparent,
+        ],
+        stops: const [0.0, 0.15, 0.4, 0.5, 0.6, 0.85, 1.0],
+      ).createShader(Rect.fromLTWH(
+        shineCenter - shineWidth / 2,
+        0,
+        shineWidth,
+        size.height,
+      ));
+
+    // Draw the shine as a rotated rectangle
+    canvas.save();
+    canvas.translate(shineCenter, size.height / 2);
+    canvas.rotate(-0.3); // Slight angle for the shine
+    canvas.drawRect(
+      Rect.fromCenter(
+        center: Offset.zero,
+        width: shineWidth,
+        height: size.height * 1.8, // Taller to cover full card
+      ),
+      paint,
+    );
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _ShinePainter oldDelegate) =>
+      oldDelegate.position != position;
+}
+
 class _SearchArcPainter extends CustomPainter {
   final double progress;
 
@@ -6952,7 +7105,7 @@ class _SearchArcPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = const Color.fromARGB(255, 76, 175, 80)
+      ..color = const Color.fromARGB(255, 0, 188, 212)
       ..strokeWidth = 3
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;

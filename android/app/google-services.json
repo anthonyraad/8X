@@ -1,0 +1,49 @@
+{
+  "project_info": {
+    "project_number": "763109943495",
+    "firebase_url": "https://x-multiplayer-default-rtdb.firebaseio.com",
+    "project_id": "x-multiplayer",
+    "storage_bucket": "x-multiplayer.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:763109943495:android:5720dc87372e4ba4f9f6e2",
+        "android_client_info": {
+          "package_name": "com.example.scssrs"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDcWK7ZZWziGfMBu9j5IQMxVEgi6jR5mck"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:763109943495:android:7ee914140c4e6624f9f6e2",
+        "android_client_info": {
+          "package_name": "com.raadscapes.scssrs"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDcWK7ZZWziGfMBu9j5IQMxVEgi6jR5mck"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
