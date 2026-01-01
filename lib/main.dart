@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'ui/game_screen.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -14,9 +15,17 @@ void main() async {
     DeviceOrientation.portraitDown,
   ]);
 
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+  // On web, we need to pass options. On Android/iOS, google-services.json handles it.
+  if (kIsWeb) {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+  } else {
+    // Check if already initialized (by google-services.json)
+    if (Firebase.apps.isEmpty) {
+      await Firebase.initializeApp();
+    }
+  }
   
   // Sign in anonymously
   await FirebaseAuth.instance.signInAnonymously();

@@ -55,7 +55,8 @@ class _GameScreenState extends State<GameScreen> {
   List<String> backgrounds = [
     'assets/images/playmat1.png',
     'assets/images/playmat2.png',
-    'assets/images/playmat3.png'
+    'assets/images/playmat3.png',
+    'assets/images/playmat4.png'
   ];
   int currentBackgroundIndex = 0;
   bool isTransitioning = false;
@@ -69,11 +70,16 @@ class _GameScreenState extends State<GameScreen> {
   bool gameOver = false;
   bool showInitialOverlay = true;
   int _gameSessionId = 0; // Increments when a new game starts, used for prize card animations
-  bool _showPrizeWinShine = false; // Triggers shine animation when prize is won
+  bool _showPrizeWinShine = false; // Triggers shine animation when player wins prize
+  bool _showOpponentWinShine = false; // Triggers dark shine when opponent wins prize
+  bool _showCardSplash = false;
   bool showRules = false;
   bool _waitingForRematch = false;
   bool _aceDialogOpen = false;
   bool _isOpponentTurnRunning = false;
+  
+  // Multiplayer win streaks - tracks consecutive wins per player for timer reduction
+  Map<String, int> multiplayerWinStreaks = {};
 
   String message = '';
   List<int> selectedIndices = [];
@@ -187,9 +193,7 @@ Future<void> _loadHighScore() async {
     setState(() {
       highScore = prefs.getInt('winStreakHighScore') ?? 0;
     });
-    print('Loaded high score: $highScore');
   } catch (e) {
-    print('Error loading high score: $e');
     highScore = 0;
   }
 }
@@ -199,9 +203,7 @@ Future<void> _saveHighScore(int score) async {
   try {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('winStreakHighScore', score);
-    print('Saved high score: $score');
   } catch (e) {
-    print('Error saving high score: $e');
   }
 }
 
@@ -228,7 +230,6 @@ void _checkAndUpdateHighScore() {
   }
 
   void _prepareForMultiplayer() {
-    print('DEBUG: Preparing for multiplayer transition');
 
     // Cancel any active AI timers
     turnTimer?.cancel();
@@ -256,12 +257,10 @@ void _checkAndUpdateHighScore() {
       clearSelections();
     });
 
-    print('DEBUG: Multiplayer preparation complete');
   }
 
 // Quick Match - Search for an open game or create one
   Future<void> _searchForGame() async {
-    print('DEBUG: _searchForGame() called');
     
     // Light preparation - don't use _prepareForMultiplayer() as it resets too much
     turnTimer?.cancel();
@@ -283,11 +282,9 @@ void _checkAndUpdateHighScore() {
 
     try {
       _generatePlayerId();
-      print('DEBUG: Generated player ID: $playerId');
       
       // Query specifically for quick match rooms (not room-code rooms)
       final DatabaseReference roomsRef = FirebaseDatabase.instance.ref('rooms');
-      print('DEBUG: Querying Firebase for quick match rooms...');
       
       final snapshot = await roomsRef
           .orderByChild('isQuickMatch')
@@ -295,13 +292,11 @@ void _checkAndUpdateHighScore() {
           .limitToFirst(20)
           .get();
 
-      print('DEBUG: Firebase query complete. Exists: ${snapshot.exists}');
 
       String? foundRoomCode;
       
       if (snapshot.exists) {
         final rooms = snapshot.value as Map<dynamic, dynamic>;
-        print('DEBUG: Found ${rooms.length} quick match rooms');
         final now = DateTime.now().millisecondsSinceEpoch;
         
         // Find a suitable quick match room that's waiting for opponent
@@ -312,7 +307,6 @@ void _checkAndUpdateHighScore() {
           final host = roomData['host'] as String?;
           final players = roomData['players'] as Map<dynamic, dynamic>? ?? {};
           
-          print('DEBUG: Checking room ${entry.key}: gameState=$gameState, players=${players.length}, host=$host');
           
           // Room must be: waiting state, less than 2 minutes old, has 1 player, not ours
           final isWaiting = gameState == 'waiting';
@@ -322,38 +316,30 @@ void _checkAndUpdateHighScore() {
           
           if (isWaiting && isRecent && hasOnePlayer && isNotOurs) {
             foundRoomCode = entry.key as String;
-            print('DEBUG: Found suitable room: $foundRoomCode');
             break;
           }
         }
       } else {
-        print('DEBUG: No quick match rooms found in Firebase');
       }
 
       if (foundRoomCode != null) {
         // Found an open room - join it
-        print('DEBUG: Joining quick match room: $foundRoomCode');
         await _joinQuickMatchRoom(foundRoomCode);
       } else {
         // No room found - create one and wait
-        print('DEBUG: Creating new quick match room');
         await _createQuickMatchRoom();
       }
-    } catch (e, stackTrace) {
-      print('ERROR in quick match: $e');
-      print('Stack trace: $stackTrace');
+    } catch (e) {
       // Show error in the Versus Mode modal so user can try again
       _resetToAIMode(showError: true, errorMessage: 'Connection error. Please try again.');
     }
   }
 
   Future<void> _createQuickMatchRoom() async {
-    print('DEBUG: _createQuickMatchRoom() called');
     try {
       roomCode = _generateRoomCode();
       isHost = true;
       gameMode = 'human';
-      print('DEBUG: Creating room: $roomCode');
 
       final DatabaseReference roomRef =
           FirebaseDatabase.instance.ref('rooms/$roomCode');
@@ -378,7 +364,6 @@ void _checkAndUpdateHighScore() {
         'modifierAssignments': {},
       });
 
-      print('DEBUG: Room $roomCode created successfully. Listening for opponent...');
       
       setState(() {
         waitingForOpponent = true;
@@ -388,10 +373,7 @@ void _checkAndUpdateHighScore() {
       });
 
       _listenToRoom();
-      print('DEBUG: Now listening to room $roomCode');
-    } catch (e, stackTrace) {
-      print('ERROR creating quick match room: $e');
-      print('Stack trace: $stackTrace');
+    } catch (e) {
       // Show error in the Versus Mode modal so user can try again
       _resetToAIMode(showError: true, errorMessage: 'Error creating game. Please try again.');
     }
@@ -427,7 +409,6 @@ void _checkAndUpdateHighScore() {
 
       if (!result.committed) {
         // Room was taken, search again
-        print('DEBUG: Room was taken, searching again');
         await _searchForGame();
         return;
       }
@@ -450,14 +431,12 @@ void _checkAndUpdateHighScore() {
 
       _listenToRoom();
     } catch (e) {
-      print('Error joining quick match room: $e');
       // Try searching again
       await _searchForGame();
     }
   }
 
   void _cancelQuickMatch() {
-    print('DEBUG: _cancelQuickMatch() called');
     quickMatchSubscription?.cancel();
     quickMatchSubscription = null;
     gameSubscription?.cancel();
@@ -465,7 +444,6 @@ void _checkAndUpdateHighScore() {
     
     // If we created a room, delete it
     if (isHost && roomCode != null) {
-      print('DEBUG: Deleting room $roomCode');
       FirebaseDatabase.instance.ref('rooms/$roomCode').remove();
     }
     
@@ -674,7 +652,6 @@ void _checkAndUpdateHighScore() {
           _handleGameOverFromFirebase(data);
         }
       } catch (e) {
-        print('Error in _listenToRoom: $e');
         if (mounted) {
           setState(() {
             connectionStatus = 'Connection error occurred';
@@ -786,12 +763,13 @@ void _checkAndUpdateHighScore() {
         'playerModifiers/$opponentId': oppModifiersSanitized,
         'lastTimeoutPenalty': null,
         'rematchRequests': {},
+        // Initialize win streaks if not present (preserve existing values for rematches)
+        'winStreaks/$playerId': multiplayerWinStreaks[playerId] ?? 0,
+        'winStreaks/$opponentId': multiplayerWinStreaks[opponentId] ?? 0,
       };
 
       await roomRef.update(updates);
-      print('DEBUG: Complete game state with modifier assignments initialized');
     } catch (e) {
-      print('Error initializing complete game state: $e');
     }
   }
 
@@ -820,8 +798,6 @@ void _checkAndUpdateHighScore() {
               .map((sanitized) => _unsanitizeModifierFromFirebase(sanitized))
               .toList();
 
-          print(
-              'DEBUG: Updated my available modifiers: $playerAvailableModifiers');
         }
 
         // Update opponent's available modifiers
@@ -835,8 +811,6 @@ void _checkAndUpdateHighScore() {
               .map((sanitized) => _unsanitizeModifierFromFirebase(sanitized))
               .toList();
 
-          print(
-              'DEBUG: Updated opponent available modifiers: $opponentAvailableModifiers');
         }
       }
 
@@ -906,18 +880,6 @@ void _checkAndUpdateHighScore() {
       }
 
       // ENHANCED DEBUG LOGGING
-      print('=== FIREBASE UPDATE DEBUG ===');
-      print('My playerId: $playerId');
-      print('My opponentId: $opponentId');
-      print('Firebase turn: $turn');
-      print('Firebase gameState: $gameState');
-      print('My current isPlayerTurn: $isPlayerTurn');
-      print('Am I host: $isHost');
-      print('Current message: $message');
-      print('Game over: $gameOver');
-      print('Field length: ${fieldData.length}');
-      print('Activity log length: ${activityLogData.length}');
-      print('==============================');
 
       // Get game data
       final gameData = data['gameData'] as Map<dynamic, dynamic>? ?? {};
@@ -935,23 +897,26 @@ void _checkAndUpdateHighScore() {
       final drawPileSizes =
           data['drawPileSizes'] as Map<dynamic, dynamic>? ?? {};
       final maxHandSizes = data['maxHandSizes'] as Map<dynamic, dynamic>? ?? {};
+      
+      // Read win streaks for dynamic timer calculation
+      final winStreaksData = data['winStreaks'] as Map<dynamic, dynamic>? ?? {};
+      for (var entry in winStreaksData.entries) {
+        multiplayerWinStreaks[entry.key as String] = entry.value as int? ?? 0;
+      }
 
       setState(() {
         // FIXED: Store previous turn state to detect changes and add debug logging
         final wasMyTurn = isPlayerTurn;
         final newTurnState = (turn == playerId);
 
-        print('TURN DEBUG: wasMyTurn=$wasMyTurn, newTurnState=$newTurnState');
 
         // CRITICAL: Add validation that we have proper opponent ID
         if (opponentId == null) {
-          print('WARNING: opponentId is null! Attempting to find opponent...');
           // Try to find opponent from players in the room data
           if (players.length == 2) {
             for (String pid in players.keys.cast<String>()) {
               if (pid != playerId) {
                 opponentId = pid;
-                print('DEBUG: Found opponentId: $opponentId');
                 break;
               }
             }
@@ -1051,7 +1016,6 @@ void _checkAndUpdateHighScore() {
                   .cast<String>()); // FIXED: Create mutable copy
           if (playerHand.isEmpty) {
             // First time setup
-            print('DEBUG: Initializing my deck and hand');
             playerDeck = myDeck;
             playerHand = List<String>.from(myDeck.sublist(3, 5));
             playerPrizeCards = List<String>.from(myDeck.sublist(0, 3));
@@ -1066,7 +1030,6 @@ void _checkAndUpdateHighScore() {
                   .cast<String>()); // FIXED: Create mutable copy
           if (opponentActualHand.isEmpty) {
             // First time setup
-            print('DEBUG: Initializing opponent deck and hand');
             opponentDeck = opponentDeckData;
             opponentActualHand =
                 List<String>.from(opponentDeckData.sublist(3, 5));
@@ -1084,7 +1047,6 @@ void _checkAndUpdateHighScore() {
           // FIXED: Only update if the data is different to prevent unnecessary overwrites
           if (handData.length != playerHand.length ||
               !_listsEqual(handData, playerHand)) {
-            print('DEBUG: Updating playerHand from Firebase: $handData');
             playerHand = handData;
           }
         }
@@ -1094,8 +1056,6 @@ void _checkAndUpdateHighScore() {
               (playerPrizeCardsData[playerId] as List<dynamic>).cast<String>());
           if (prizeData.length != playerPrizeCards.length ||
               !_listsEqual(prizeData, playerPrizeCards)) {
-            print(
-                'DEBUG: Updating playerPrizeCards from Firebase: ${prizeData.length} cards');
             playerPrizeCards = prizeData;
           }
         } else if (prizeCardCounts.containsKey(playerId)) {
@@ -1103,8 +1063,6 @@ void _checkAndUpdateHighScore() {
           // and ONLY if the count is LARGER than current (never regenerate lost cards)
           final expectedPrizeCount = prizeCardCounts[playerId] as int;
           if (expectedPrizeCount > playerPrizeCards.length) {
-            print(
-                'DEBUG: Adding missing prize cards: ${expectedPrizeCount - playerPrizeCards.length}');
             while (playerPrizeCards.length < expectedPrizeCount) {
               playerPrizeCards.add('cardback');
             }
@@ -1118,8 +1076,6 @@ void _checkAndUpdateHighScore() {
                   .cast<String>()); // FIXED: Create mutable copy
           if (drawData.length != playerDrawPile.length ||
               !_listsEqual(drawData, playerDrawPile)) {
-            print(
-                'DEBUG: Updating playerDrawPile from Firebase: ${drawData.length} cards');
             playerDrawPile = drawData;
           }
         }
@@ -1127,8 +1083,6 @@ void _checkAndUpdateHighScore() {
         if (maxHandSizes.containsKey(playerId)) {
           final maxHandSizeData = maxHandSizes[playerId] as int? ?? 2;
           if (maxHandSizeData != playerMaxHandSize) {
-            print(
-                'DEBUG: Updating playerMaxHandSize from Firebase: $maxHandSizeData');
             playerMaxHandSize = maxHandSizeData;
           }
         }
@@ -1171,11 +1125,6 @@ void _checkAndUpdateHighScore() {
               prizeCardCounts[opponentId] as int? ?? opponentPrizeCards.length;
           final opponentDrawSize =
               drawPileSizes[opponentId] as int? ?? opponentDrawPile.length;
-          final opponentMaxHandSize = maxHandSizes[opponentId] as int? ?? 2;
-
-          print(
-              'DEBUG: Opponent sizes - Hand: $opponentHandSize, Prizes: $opponentPrizeCount, Draw: $opponentDrawSize');
-
           // Check if opponent won a prize card (their count decreased) before updating
           final previousOpponentPrizeCount = opponentPrizeCards.length;
           final opponentCountDecreased =
@@ -1187,18 +1136,23 @@ void _checkAndUpdateHighScore() {
 
           // FIXED: Only update if sizes changed to prevent unnecessary rebuilds
           if (opponentHand.length != opponentHandSize) {
-            print(
-                'DEBUG: Updating opponent hand size from ${opponentHand.length} to $opponentHandSize');
             opponentHand = List.generate(opponentHandSize, (_) => 'cardback');
           }
           if (opponentPrizeCards.length != opponentPrizeCount) {
-            print(
-                'DEBUG: Updating opponent prize count from ${opponentPrizeCards.length} to $opponentPrizeCount');
 
             // Only play prize sound if opponent legitimately won a prize (not penalty)
             if (opponentWonPrize) {
               Future.delayed(const Duration(milliseconds: 100), () {
                 playPrizeCardSound();
+              });
+              // Trigger opponent win shine animation for multiplayer
+              _showOpponentWinShine = true;
+              Future.delayed(const Duration(milliseconds: 800), () {
+                if (mounted) {
+                  setState(() {
+                    _showOpponentWinShine = false;
+                  });
+                }
               });
             }
 
@@ -1206,8 +1160,6 @@ void _checkAndUpdateHighScore() {
                 List.generate(opponentPrizeCount, (_) => 'cardback');
           }
           if (opponentDrawPile.length != opponentDrawSize) {
-            print(
-                'DEBUG: Updating opponent draw pile from ${opponentDrawPile.length} to $opponentDrawSize');
             opponentDrawPile =
                 List.generate(opponentDrawSize, (_) => 'cardback');
           }
@@ -1217,14 +1169,12 @@ void _checkAndUpdateHighScore() {
         if (!gameOver) {
           if (isPlayerTurn && !wasMyTurn) {
             // Turn switched TO me
-            print('🟢 TURN STARTED FOR ME');
             message = "Your turn!";
             turnTimer?.cancel();
             startTimer();
             clearSelections();
           } else if (!isPlayerTurn && wasMyTurn) {
             // Turn switched AWAY from me
-            print('🔴 TURN ENDED FOR ME');
             message = "Opponent's turn!";
             turnTimer?.cancel();
             clearSelections();
@@ -1239,15 +1189,12 @@ void _checkAndUpdateHighScore() {
           } else if (isPlayerTurn &&
               (turnTimer == null || !turnTimer!.isActive)) {
             // I still have turn but timer isn't running
-            print('⚠️ RESTARTING TIMER FOR MY TURN');
             message = "Your turn!";
             startTimer();
             clearSelections();
           } else if (!isPlayerTurn) {
-            print('⏸️ WAITING FOR OPPONENT');
             message = "Opponent's turn!";
           } else {
-            print('ℹ️ NO TURN CHANGE NEEDED');
           }
         }
 
@@ -1258,15 +1205,7 @@ void _checkAndUpdateHighScore() {
       });
 
       // Add debug logging for modifier state
-      print('=== MODIFIER DEBUG ===');
-      print('My available modifiers: $playerAvailableModifiers');
-      print('My modifier usage: $playerModifiers');
-      print('Opponent available modifiers: $opponentAvailableModifiers');
-      print('Opponent modifier usage: $opponentModifiers');
-      print('======================');
     } catch (e) {
-      print('❌ ERROR in _updateGameFromFirebase: $e');
-      print('Stack trace: ${StackTrace.current}');
     }
   }
 
@@ -1280,88 +1219,102 @@ void _checkAndUpdateHighScore() {
   }
 
   void _handleGameOverFromFirebase(Map<dynamic, dynamic> data) {
-    final winner = data['winner'] as String?;
-    final winnerMessage = data['winnerMessage'] as String?;
+  final winner = data['winner'] as String?;
+  final winnerMessage = data['winnerMessage'] as String?;
 
-    // First, ensure game over state is set for both players
-    if (!gameOver) {
-      setState(() {
-        gameOver = true;
-        this.winner = winner == playerId ? 'player' : 'opponent';
-        message = winnerMessage ??
-            (winner == playerId ? "You win!" : "Opponent wins!");
-        isPlayerTurn = false;
-        clearSelections();
-      });
-      turnTimer?.cancel();
+  // First, ensure game over state is set for both players
+  if (!gameOver) {
+    setState(() {
+      gameOver = true;
+      this.winner = winner == playerId ? 'player' : 'opponent';
+      message = winnerMessage ??
+          (winner == playerId ? "You win!" : "Opponent wins!");
+      isPlayerTurn = false;
+      clearSelections();
+    });
+    turnTimer?.cancel();
 
-      Future.delayed(const Duration(milliseconds: 100), () {
-        if (winner == playerId) {
-          playGameWinSound();
-        } else {
-          playGameLossSound();
+    Future.delayed(const Duration(milliseconds: 100), () {
+      if (winner == playerId) {
+        playGameWinSound();
+      } else {
+        playGameLossSound();
+      }
+    });
+  }
+
+  // FIX: Sync win streaks IMMEDIATELY when game ends, before checking rematch status
+  final winStreaksData = data['winStreaks'] as Map<dynamic, dynamic>? ?? {};
+  if (winStreaksData.isNotEmpty) {
+    setState(() {
+      for (var entry in winStreaksData.entries) {
+        multiplayerWinStreaks[entry.key as String] = entry.value as int? ?? 0;
+      }
+      
+      // FIX: Update the local winStreak variable that the UI displays
+      if (playerId != null && multiplayerWinStreaks.containsKey(playerId)) {
+        winStreak = multiplayerWinStreaks[playerId]!;
+        // Check and update high score
+        _checkAndUpdateHighScore();
+      }
+    });
+  }
+
+  // Handle rematch requests - but don't change gameOver state until both players are ready
+  final rematchRequests =
+      data['rematchRequests'] as Map<dynamic, dynamic>? ?? {};
+
+  // If this player hasn't requested rematch yet, don't process other player's request
+  if (!rematchRequests.containsKey(playerId)) {
+    return;
+  }
+
+  // Only proceed if both players have requested rematch
+  if (rematchRequests.length == 2 && gameOver) {
+    // Get who went first last game and alternate
+    final lastFirstPlayer = data['firstPlayer'] as String?;
+    final nextFirstPlayer =
+        (lastFirstPlayer == playerId) ? opponentId : playerId;
+
+    if (isHost) {
+      // Host initializes the new game
+      _resetGameState();
+      _initializeCompleteGameState(nextFirstPlayer).then((_) {
+        if (mounted) {
+          setState(() {
+            gameOver = false;
+            waitingForOpponent = false;
+            _waitingForRematch = false;
+            message = (nextFirstPlayer == playerId)
+                ? "Your turn!"
+                : "Opponent's turn!";
+            isPlayerTurn = (nextFirstPlayer == playerId);
+          });
+          if (nextFirstPlayer == playerId) {
+            startTimer();
+          }
+        }
+      }).catchError((error) {
+        // Reset waiting state on error
+        if (mounted) {
+          setState(() {
+            _waitingForRematch = false;
+            message = "Failed to start new game";
+          });
         }
       });
-    }
+    } else {
+      // Non-host waits for host to initialize, but doesn't change gameOver yet
+      setState(() {
+        _waitingForRematch = true;
+        message = "Starting new game...";
+      });
 
-    // Handle rematch requests - but don't change gameOver state until both players are ready
-    final rematchRequests =
-        data['rematchRequests'] as Map<dynamic, dynamic>? ?? {};
-
-    // If this player hasn't requested rematch yet, don't process other player's request
-    if (!rematchRequests.containsKey(playerId)) {
-      return;
-    }
-
-    // Only proceed if both players have requested rematch
-    if (rematchRequests.length == 2 && gameOver) {
-      // Get who went first last game and alternate
-      final lastFirstPlayer = data['firstPlayer'] as String?;
-      final nextFirstPlayer =
-          (lastFirstPlayer == playerId) ? opponentId : playerId;
-
-      if (isHost) {
-        // Host initializes the new game
-        print('Host starting rematch for both players');
-        _resetGameState();
-        _initializeCompleteGameState(nextFirstPlayer).then((_) {
-          if (mounted) {
-            setState(() {
-              gameOver = false;
-              waitingForOpponent = false;
-              _waitingForRematch = false;
-              message = (nextFirstPlayer == playerId)
-                  ? "Your turn!"
-                  : "Opponent's turn!";
-              isPlayerTurn = (nextFirstPlayer == playerId);
-            });
-            if (nextFirstPlayer == playerId) {
-              startTimer();
-            }
-          }
-        }).catchError((error) {
-          print('Error initializing rematch: $error');
-          // Reset waiting state on error
-          if (mounted) {
-            setState(() {
-              _waitingForRematch = false;
-              message = "Failed to start new game";
-            });
-          }
-        });
-      } else {
-        // Non-host waits for host to initialize, but doesn't change gameOver yet
-        print('Non-host waiting for host to initialize rematch');
-        setState(() {
-          _waitingForRematch = true;
-          message = "Starting new game...";
-        });
-
-        // The actual game state change will come through the normal Firebase listener
-        // when the host updates the game state to 'playing'
-      }
+      // The actual game state change will come through the normal Firebase listener
+      // when the host updates the game state to 'playing'
     }
   }
+}
 
 // Also add this helper method to handle the transition from waiting to playing
   void _handleRematchStart(String nextFirstPlayer) {
@@ -1430,7 +1383,6 @@ void _checkAndUpdateHighScore() {
         try {
           final result = await roomRef.runTransaction((Object? current) {
             if (current == null) {
-              print('DEBUG: Transaction aborted - room no longer exists');
               return Transaction.abort();
             }
 
@@ -1440,13 +1392,10 @@ void _checkAndUpdateHighScore() {
 
             // CRITICAL: Enhanced validation
             if (currentTurn != playerId) {
-              print(
-                  'DEBUG: Turn validation failed - currentTurn: $currentTurn, playerId: $playerId');
               return Transaction.abort();
             }
 
             if (currentGameState == 'gameOver') {
-              print('DEBUG: Game is already over, aborting transaction');
               return Transaction.abort();
             }
 
@@ -1490,16 +1439,12 @@ void _checkAndUpdateHighScore() {
                 !gameOver &&
                 currentGameState == 'playing') {
               data['turn'] = opponentId;
-              print(
-                  'DEBUG: Successfully switching turn to opponent: $opponentId');
             }
 
             return Transaction.success(data);
           });
 
           if (result.committed) {
-            print(
-                'DEBUG: Firebase transaction committed successfully on attempt ${attempt + 1}');
 
             // CRITICAL: Only update local state AFTER successful Firebase commit
             if (mounted) {
@@ -1510,8 +1455,6 @@ void _checkAndUpdateHighScore() {
             }
             return; // Success, exit retry loop
           } else {
-            print(
-                'DEBUG: Firebase transaction failed to commit on attempt ${attempt + 1}');
 
             if (attempt == maxRetries - 1) {
               throw Exception(
@@ -1522,7 +1465,6 @@ void _checkAndUpdateHighScore() {
             retryDelay *= 2;
           }
         } catch (e) {
-          print('Error in transaction attempt ${attempt + 1}: $e');
 
           if (attempt == maxRetries - 1) {
             rethrow;
@@ -1533,7 +1475,6 @@ void _checkAndUpdateHighScore() {
         }
       }
     } catch (e) {
-      print('Final error updating Firebase game state: $e');
 
       // IMPROVED: Better error recovery
       if (mounted) {
@@ -1568,7 +1509,6 @@ void _checkAndUpdateHighScore() {
         _updateGameFromFirebase(data);
       }
     } catch (e) {
-      print('Error refreshing game state: $e');
       // If refresh fails, allow player to try again
       if (mounted) {
         setState(() {
@@ -1604,7 +1544,6 @@ void _checkAndUpdateHighScore() {
       // Note: The actual game state transition will be handled by _handleGameOverFromFirebase
       // when it detects both players have requested a rematch
     } catch (e) {
-      print('Error starting rematch: $e');
       setState(() {
         _waitingForRematch = false;
         message = "Failed to start rematch";
@@ -1615,7 +1554,6 @@ void _checkAndUpdateHighScore() {
   void _handleOpponentDisconnect() {
     if (gameMode != 'human') return;
 
-    print('DEBUG: Handling opponent disconnect');
 
     setState(() {
       message = "Opponent disconnected";
@@ -1638,7 +1576,6 @@ void _checkAndUpdateHighScore() {
     // This method is now largely handled by Firebase initialization
     // Just reset local state
     try {
-      print('DEBUG: Setting up multiplayer game - isHost: $isHost');
 
       _resetGameState();
 
@@ -1648,9 +1585,7 @@ void _checkAndUpdateHighScore() {
 
       setState(() {});
 
-      print('DEBUG: Multiplayer game setup complete');
     } catch (e) {
-      print('Error setting up multiplayer game: $e');
       setState(() {
         connectionStatus = 'Failed to setup game: $e';
         showRoomSelection = true;
@@ -1691,7 +1626,6 @@ void _checkAndUpdateHighScore() {
         roomRef.child('players').child(playerId!).remove();
       }
     } catch (e) {
-      print('Error leaving room: $e');
     } finally {
       _resetMultiplayerState();
       _resetToAIMode();
@@ -1819,6 +1753,8 @@ void _checkAndUpdateHighScore() {
       opponentActualDrawPile = [];
       lastKnownOpponentHandSize = null;
       lastKnownOpponentDrawPileSize = null;
+      // Reset multiplayer win streaks when leaving a session
+      multiplayerWinStreaks = {};
     });
   }
 
@@ -1828,8 +1764,6 @@ void _checkAndUpdateHighScore() {
 // Validate all indices before removing any
     for (int i = 0; i < indices.length; i++) {
       if (indices[i] < 0 || indices[i] >= hand.length) {
-        print(
-            'ERROR: Index ${indices[i]} out of bounds for $handName (length: ${hand.length})');
         return;
       }
     }
@@ -1843,7 +1777,6 @@ void _checkAndUpdateHighScore() {
       if (index >= 0 && index < hand.length) {
         hand.removeAt(index);
       } else {
-        print('CRITICAL: Index became invalid during removal: $index');
         break;
       }
     }
@@ -1852,8 +1785,6 @@ void _checkAndUpdateHighScore() {
   T? safeListAccess<T>(List<T> list, int index, [String? listName]) {
     if (index < 0 || index >= list.length) {
       if (listName != null) {
-        print(
-            'WARNING: Index $index out of bounds for $listName (length: ${list.length})');
       }
       return null;
     }
@@ -1863,8 +1794,6 @@ void _checkAndUpdateHighScore() {
   bool validateSelections() {
     for (int i = 0; i < selectedIndices.length; i++) {
       if (selectedIndices[i] < 0 || selectedIndices[i] >= playerHand.length) {
-        print(
-            'Invalid selectedIndices[$i]: ${selectedIndices[i]} (hand length: ${playerHand.length})');
         return false;
       }
     }
@@ -1872,8 +1801,6 @@ void _checkAndUpdateHighScore() {
     int expectedOpsCount =
         selectedIndices.length > 1 ? selectedIndices.length - 1 : 0;
     if (selectedOps.length != expectedOpsCount) {
-      print(
-          'selectedOps length mismatch: ${selectedOps.length} vs expected $expectedOpsCount');
       return false;
     }
 
@@ -1885,7 +1812,6 @@ void _checkAndUpdateHighScore() {
       try {
         hand.add(drawPile.removeAt(0));
       } catch (e) {
-        print('Error drawing card: $e');
         break;
       }
     }
@@ -1919,6 +1845,7 @@ void _checkAndUpdateHighScore() {
     opponentDrawPile = [];
     opponentPrizeCards = [];
     processedTimeoutPenalties = <String>{};
+    _configureAudioSession(); // Allow mixing with other audio (e.g., Spotify)
     _preloadTapSound();
     _configureLowLatencyAudio();
     _loadHighScore(); 
@@ -1930,7 +1857,6 @@ void _checkAndUpdateHighScore() {
       await _tapAudioPlayer.setSource(AssetSource('sounds/tap.mp3'));
       await _tapAudioPlayer.setReleaseMode(ReleaseMode.stop);
     } catch (e) {
-      print('Error preloading tap sound: $e');
     }
   }
 
@@ -1938,7 +1864,32 @@ void _checkAndUpdateHighScore() {
     try {
       await _tapAudioPlayer.setPlayerMode(PlayerMode.lowLatency);
     } catch (e) {
-      print('Low latency mode not supported: $e');
+    }
+  }
+
+  /// Configure audio to mix with other apps (e.g., Spotify) instead of pausing them
+  Future<void> _configureAudioSession() async {
+    try {
+      // Set global audio context to allow mixing with other audio sources
+      final audioContext = AudioContext(
+        iOS: AudioContextIOS(
+          category: AVAudioSessionCategory.ambient, // Mixes with other audio
+          options: {
+            AVAudioSessionOptions.mixWithOthers,
+          },
+        ),
+        android: AudioContextAndroid(
+          isSpeakerphoneOn: false,
+          audioMode: AndroidAudioMode.normal,
+          stayAwake: false,
+          contentType: AndroidContentType.music,
+          usageType: AndroidUsageType.game,
+          audioFocus: AndroidAudioFocus.none, // Don't request audio focus
+        ),
+      );
+      await AudioPlayer.global.setAudioContext(audioContext);
+    } catch (e) {
+      // Silently handle - audio will still work, just might pause other apps
     }
   }
 
@@ -1991,57 +1942,59 @@ void _checkAndUpdateHighScore() {
               fontWeight: FontWeight.w500,
               fontSize: isMobile ? 9 : 11,
               letterSpacing: 0.7,
-              fontFamily: 'Roboto',
+              fontFamily: 'Balatro',
               height: 1.0,
             ),
           ),
           SizedBox(width: isMobile ? 5 : 7),
           DropdownButton<int>(
-            value: aiDifficulty,
-            dropdownColor: Colors.black87,
-            style: const TextStyle(
-              color: Color.fromARGB(201, 64, 182, 255),
-              fontWeight: FontWeight.w500,
-              fontSize: 11,
-              fontFamily: 'Roboto',
-              height: 1.0,
-            ),
-            underline: SizedBox.shrink(),
-            icon: const Icon(
-              Icons.arrow_drop_down,
-              color: Color.fromARGB(255, 64, 182, 255),
-              size: 15,
-            ),
-            isDense: true, // ADDED: Makes dropdown more compact
-            items: const [
-              DropdownMenuItem(
-                value: 1,
-                child: Text(
-                  'Dull',
-                  style: TextStyle(fontFamily: 'Roboto'),
-                ),
-              ),
-              DropdownMenuItem(
-                value: 2,
-                child: Text(
-                  'Keen',
-                  style: TextStyle(fontFamily: 'Roboto'),
-                ),
-              ),
-              DropdownMenuItem(
-                value: 3,
-                child: Text(
-                  'Sharp',
-                  style: TextStyle(fontFamily: 'Roboto'),
-                ),
-              ),
-            ],
-            onChanged: (value) {
-              setState(() {
-                aiDifficulty = value!;
-              });
-            },
-          ),
+  value: aiDifficulty,
+  dropdownColor: Colors.black87,
+  style: const TextStyle(
+    color: Color.fromARGB(201, 64, 182, 255),
+    fontWeight: FontWeight.w500,
+    fontSize: 11,
+    fontFamily: 'Balatro',
+    height: 1.0,
+  ),
+  underline: SizedBox.shrink(),
+  icon: const Icon(
+    Icons.arrow_drop_down,
+    color: Color.fromARGB(255, 64, 182, 255),
+    size: 15,
+  ),
+  isDense: true,
+  // Remove isExpanded if you added it
+  // Remove width: double.infinity from children
+  items: const [
+    DropdownMenuItem(
+      value: 1,
+      child: Text(
+        'Dull',
+        style: TextStyle(fontFamily: 'Balatro'),
+      ),
+    ),
+    DropdownMenuItem(
+      value: 2,
+      child: Text(
+        'Keen',
+        style: TextStyle(fontFamily: 'Balatro'),
+      ),
+    ),
+    DropdownMenuItem(
+      value: 3,
+      child: Text(
+        'Sharp',
+        style: TextStyle(fontFamily: 'Balatro'),
+      ),
+    ),
+  ],
+  onChanged: (value) {
+    setState(() {
+      aiDifficulty = value!;
+    });
+  },
+)
         ],
       ),
     );
@@ -2172,7 +2125,6 @@ Widget buildHighScore({required bool isMobile}) {
         'playerModifiers/$playerId': Map.from(playerModifiers),
       });
     } catch (e) {
-      print('Error updating mulligan state: $e');
     }
   }
 
@@ -2258,7 +2210,6 @@ Widget buildHighScore({required bool isMobile}) {
         'playerModifiers/$playerId': Map.from(playerModifiers),
       });
     } catch (e) {
-      print('Error updating draw1 state: $e');
     }
   }
 
@@ -2322,7 +2273,6 @@ Widget buildHighScore({required bool isMobile}) {
         'playerModifiers/$playerId': Map.from(playerModifiers),
       });
     } catch (e) {
-      print('Error updating rewind state: $e');
     }
   }
 
@@ -2343,6 +2293,57 @@ Widget buildHighScore({required bool isMobile}) {
       _useRewindModifier();
     }
   }
+
+void _handleSwipeUpModifier(String modifierType) async {
+  if (!isPlayerTurn || gameOver || selectedIndices.isEmpty) return;
+  
+  // Add Firebase turn validation for multiplayer
+  if (gameMode == 'human' && roomCode != null) {
+    try {
+      final snapshot = await FirebaseDatabase.instance
+          .ref('rooms/$roomCode/turn')
+          .get();
+      final currentTurn = snapshot.value as String?;
+      
+      if (currentTurn != playerId) {
+        setState(() {
+          message = "Not your turn!";
+        });
+        return;
+      }
+    } catch (e) {
+      return;
+    }
+  }
+
+  // Handle instant-use modifiers (mulligan, draw1, rewind)
+  if (['mulligan', 'draw1', 'rewind'].contains(modifierType)) {
+    _useModifier(modifierType);
+    return;
+  }
+
+  // For calculation modifiers, select it and immediately play
+  if (['-0.5', '2x', '+3', '-3', '-1', '+1', '+11'].contains(modifierType)) {
+    HapticFeedback.lightImpact();
+    
+    setState(() {
+      activePlayerModifier = modifierType;
+      showModifierSelection = true;
+    });
+    
+    // Add to activity log
+    activityLog.add('Selected $modifierType mod');
+    activityLogColor = Colors.blueAccent;
+    
+    playModifierSound();
+    
+    // Small delay for visual feedback, then auto-play
+    await Future.delayed(const Duration(milliseconds: 30));
+    
+    // Auto-play the selected cards with modifier
+    await playSelectedCards();
+  }
+}
 
   void _selectValueModifier(String modifierType) {
     if (!playerModifiers[modifierType]! && isPlayerTurn && !gameOver) {
@@ -2405,7 +2406,6 @@ Widget buildHighScore({required bool isMobile}) {
 
       await roomRef.update(updates);
     } catch (e) {
-      print('Error updating modifier state: $e');
     }
   }
 
@@ -2478,7 +2478,6 @@ Widget buildHighScore({required bool isMobile}) {
         startTimer();
       }
     } catch (e) {
-      print('Error setting up game: $e');
     }
   }
 
@@ -2666,7 +2665,6 @@ Widget buildHighScore({required bool isMobile}) {
       ]) {
         // Check timeout
         if (DateTime.now().difference(startTime) > maxCalculationTime) {
-          print('Probability calculation timeout - returning partial results');
           break;
         }
 
@@ -2675,7 +2673,6 @@ Widget buildHighScore({required bool isMobile}) {
 
         // Bounds checking to prevent invalid states
         if (played < 0 || played > totalInDeck) {
-          print('Invalid played count for $cardValue: $played');
           played = played.clamp(0, totalInDeck);
         }
 
@@ -2687,7 +2684,6 @@ Widget buildHighScore({required bool isMobile}) {
             totalUnknownCards > 0 ? remaining / totalUnknownCards : 0.0;
       }
     } catch (e) {
-      print('Error in probability calculation: $e');
       return {}; // Return empty map as fallback
     }
 
@@ -2729,7 +2725,6 @@ Widget buildHighScore({required bool isMobile}) {
         for (double target in targets) {
           // Check timeout during nested loops
           if (DateTime.now().difference(startTime) > maxEvaluationTime) {
-            print('Strategic evaluation timeout - using partial results');
             break;
           }
 
@@ -2754,86 +2749,98 @@ Widget buildHighScore({required bool isMobile}) {
           conservationPenalty +
           targetDifficultyBonus;
     } catch (e) {
-      print('Error in strategic evaluation: $e');
       return play['score'].toDouble() * 10; // Fallback to base score
     }
   }
 
   void checkForWin() {
-    if (gameOver) return; // Add this line to prevent duplicate calls
+  if (gameOver) return; // Add this line to prevent duplicate calls
 
-    if (playerPrizeCards.isEmpty) {
-      HapticFeedback.mediumImpact();
-      setState(() {
-        message = "You win!";
-        isPlayerTurn = false;
-        gameOver = true;
-        winner = 'player';
-        // Update win streak for both multiplayer and AI difficulty 3
-        if (gameMode == 'human' || aiDifficulty == 3) {
-          winStreak += 1;
-          _checkAndUpdateHighScore();
-        }
-        clearSelections();
-      });
-      turnTimer?.cancel();
-
-// Sync game over state to Firebase
-      if (gameMode == 'human') {
-        _updateFirebaseGameOverState('player');
+  if (playerPrizeCards.isEmpty) {
+    HapticFeedback.mediumImpact();
+    setState(() {
+      message = "You win!";
+      isPlayerTurn = false;
+      gameOver = true;
+      winner = 'player';
+      // Update win streak for both multiplayer and AI difficulty 3
+      if (gameMode == 'human' || aiDifficulty == 3) {
+        winStreak += 1;
+        _checkAndUpdateHighScore();
       }
+      clearSelections();
+    });
+    turnTimer?.cancel();
 
-      Future.delayed(const Duration(milliseconds: 100), () {
-        playGameWinSound();
-      });
-    } else if (opponentPrizeCards.isEmpty) {
-      HapticFeedback.mediumImpact();
-      setState(() {
-        message = "Opponent wins!";
-        isPlayerTurn = false;
-        gameOver = true;
-        winner = 'opponent';
-        winStreak = 0;
-        clearSelections();
-      });
-      turnTimer?.cancel();
-
-// Sync game over state to Firebase
-      if (gameMode == 'human') {
-        _updateFirebaseGameOverState('opponent');
-      }
-
-      Future.delayed(const Duration(milliseconds: 100), () {
-        playGameLossSound();
-      });
+    // Sync game over state to Firebase
+    if (gameMode == 'human') {
+      _updateFirebaseGameOverState('player');
     }
+
+    Future.delayed(const Duration(milliseconds: 100), () {
+      playGameWinSound();
+    });
+  } else if (opponentPrizeCards.isEmpty) {
+    HapticFeedback.mediumImpact();
+    setState(() {
+      message = "Opponent wins!";
+      isPlayerTurn = false;
+      gameOver = true;
+      winner = 'opponent';
+      // FIX: In multiplayer, opponent winning should still increment their streak
+      // which is tracked in Firebase. Reset local streak since we lost.
+      winStreak = 0;
+      clearSelections();
+    });
+    turnTimer?.cancel();
+
+    // Sync game over state to Firebase
+    if (gameMode == 'human') {
+      _updateFirebaseGameOverState('opponent');
+    }
+
+    Future.delayed(const Duration(milliseconds: 100), () {
+      playGameLossSound();
+    });
   }
+}
 
   Future<void> _updateFirebaseGameOverState(String winner) async {
-    if (roomCode == null || playerId == null) return;
+  if (roomCode == null || playerId == null) return;
 
-    try {
-      final DatabaseReference roomRef =
-          FirebaseDatabase.instance.ref('rooms/$roomCode');
+  try {
+    final DatabaseReference roomRef =
+        FirebaseDatabase.instance.ref('rooms/$roomCode');
 
-      await roomRef.update({
-        'gameState': 'gameOver',
-        'winner': winner == 'player' ? playerId : opponentId,
-        'winnerMessage': winner == 'player' ? 'You win!' : 'Opponent wins!',
-        'rematchRequests': {}, // Reset rematch requests
-      });
-    } catch (e) {
-      print('Error updating Firebase game over state: $e');
-    }
+    // Get current win streaks to update them
+    final winnerId = winner == 'player' ? playerId : opponentId;
+    final loserId = winner == 'player' ? opponentId : playerId;
+    final currentWinnerStreak = multiplayerWinStreaks[winnerId] ?? 0;
+    
+    // FIX: Update local map immediately so timer calculation works on rematch
+    setState(() {
+      multiplayerWinStreaks[winnerId!] = currentWinnerStreak + 1;
+      multiplayerWinStreaks[loserId!] = 0;
+    });
+    
+    await roomRef.update({
+      'gameState': 'gameOver',
+      'winner': winnerId,
+      'winnerMessage': winner == 'player' ? 'You win!' : 'Opponent wins!',
+      'rematchRequests': {}, // Reset rematch requests
+      // Winner's streak increases, loser's resets to 0
+      'winStreaks/$winnerId': multiplayerWinStreaks[winnerId],
+      'winStreaks/$loserId': 0,
+    });
+  } catch (e) {
   }
+}
 
   Future<void> playCardSound() async {
     try {
       await _audioPlayer.stop();
       await _audioPlayer.play(AssetSource('sounds/cardplay.mp3'));
-      print('Card sound played');
     } catch (e) {
-      print('Error playing card sound: $e');
     }
   }
 
@@ -2841,27 +2848,21 @@ Widget buildHighScore({required bool isMobile}) {
     try {
       await _audioPlayer.stop();
       await _audioPlayer.play(AssetSource('sounds/winplay.mp3'));
-      print('Prize card sound played');
     } catch (e) {
-      print('Error playing prize card sound: $e');
     }
   }
 
   Future<void> playGameWinSound() async {
     try {
       await _gameOverAudioPlayer.play(AssetSource('sounds/gamewin.mp3'));
-      print('Game win sound played');
     } catch (e) {
-      print('Error playing game win sound: $e');
     }
   }
 
   Future<void> playGameLossSound() async {
     try {
       await _gameOverAudioPlayer.play(AssetSource('sounds/gameloss.mp3'));
-      print('Game loss sound played');
     } catch (e) {
-      print('Error playing game loss sound: $e');
     }
   }
 
@@ -2869,9 +2870,7 @@ Widget buildHighScore({required bool isMobile}) {
     try {
       await _audioPlayer.stop();
       await _audioPlayer.play(AssetSource('sounds/modplay.mp3'));
-      print('Modifier sound played');
     } catch (e) {
-      print('Error playing modifier sound: $e');
     }
   }
 
@@ -2880,7 +2879,6 @@ Widget buildHighScore({required bool isMobile}) {
       await _tapAudioPlayer.stop();
       await _tapAudioPlayer.resume();
     } catch (e) {
-      print('Error playing tap sound: $e');
     }
   }
 
@@ -2897,7 +2895,9 @@ Widget buildHighScore({required bool isMobile}) {
     }
 
     if (gameMode == 'human') {
-      timerSeconds = 5; // Set your desired multiplayer time here
+      // Dynamic timer based on player's consecutive wins (6 seconds base, -1 per win, min 4)
+      final myWinStreak = multiplayerWinStreaks[playerId] ?? 0;
+      timerSeconds = (6 - myWinStreak).clamp(4, 6);
     } else if (aiDifficulty == 3) {
       int timeReduction = (winStreak).clamp(0, 3);
       timerSeconds = (baseTime - timeReduction).clamp(4, baseTime);
@@ -2935,6 +2935,20 @@ Widget buildHighScore({required bool isMobile}) {
       _aceDialogOpen = false;
     }
 
+    // Show grey shine animation on field card when player times out
+    if (field.isNotEmpty) {
+      setState(() {
+        _showOpponentWinShine = true;
+      });
+      Future.delayed(const Duration(milliseconds: 800), () {
+        if (mounted) {
+          setState(() {
+            _showOpponentWinShine = false;
+          });
+        }
+      });
+    }
+
     if (gameMode == 'human') {
       _updateTimeoutPenaltyToFirebase().then((_) {
         if (mounted && !gameOver) {
@@ -2944,7 +2958,6 @@ Widget buildHighScore({required bool isMobile}) {
           });
         }
       }).catchError((error) {
-        print('Error updating timeout penalty: $error');
         if (mounted && !gameOver) {
           setState(() {
             isPlayerTurn = false;
@@ -2957,7 +2970,6 @@ Widget buildHighScore({required bool isMobile}) {
       // AI mode - opponent (AI) gets a prize card when human times out
       if (opponentPrizeCards.isNotEmpty) {
         opponentPrizeCards.removeLast();
-        print('AI gets a prize card due to human timeout!');
         playPrizeCardSound();
         checkForWin();
       }
@@ -2966,100 +2978,122 @@ Widget buildHighScore({required bool isMobile}) {
     }
   }
 
-  Future<void> _updateTimeoutPenaltyToFirebase() async {
-    if (roomCode == null || opponentId == null || playerId == null) return;
+ Future<void> _updateTimeoutPenaltyToFirebase() async {
+  if (roomCode == null || opponentId == null || playerId == null) return;
 
-    print(
-        'DEBUG TIMEOUT: Player $playerId timed out - opponent $opponentId gets prize card');
+  try {
+    final DatabaseReference roomRef =
+        FirebaseDatabase.instance.ref('rooms/$roomCode');
 
-    try {
-      final DatabaseReference roomRef =
-          FirebaseDatabase.instance.ref('rooms/$roomCode');
-
-      final result = await roomRef.runTransaction((Object? current) {
-        if (current == null) {
-          print('DEBUG TIMEOUT: Transaction aborted - room no longer exists');
-          return Transaction.abort();
-        }
-
-        final data = current as Map<dynamic, dynamic>;
-        final currentTurn = data['turn'] as String?;
-        final currentGameState = data['gameState'] as String?;
-
-        print('DEBUG TIMEOUT: Current turn: $currentTurn, My ID: $playerId');
-        print('DEBUG TIMEOUT: Game state: $currentGameState');
-
-        if (currentTurn != playerId || currentGameState == 'gameOver') {
-          print('DEBUG TIMEOUT: Aborting - wrong turn or game over');
-          return Transaction.abort();
-        }
-
-        // Initialize nested maps if they don't exist
-        data['prizeCardCounts'] ??= {};
-        data['playerPrizeCards'] ??= {};
-        data['activityLog'] ??= [];
-
-        // Get current OPPONENT prize count (opponent should get a prize card)
-        final currentOpponentPrizeCount =
-            (data['prizeCardCounts'] as Map)[opponentId] as int? ?? 3;
-        print(
-            'DEBUG TIMEOUT: Opponent current prize count: $currentOpponentPrizeCount');
-
-        // Decrease OPPONENT's prize card count (they draw a prize card - get closer to winning)
-        final newOpponentPrizeCount =
-            (currentOpponentPrizeCount > 0) ? currentOpponentPrizeCount - 1 : 0;
-        (data['prizeCardCounts'] as Map)[opponentId] = newOpponentPrizeCount;
-
-        // Update the OPPONENT's prize cards list
-        final currentOpponentPrizeCards =
-            (data['playerPrizeCards'] as Map)[opponentId] as List<dynamic>? ??
-                List.generate(currentOpponentPrizeCount, (_) => 'cardback');
-
-        // Create a mutable copy to avoid fixed-length list error
-        final mutablePrizeCards = List<dynamic>.from(currentOpponentPrizeCards);
-
-        if (mutablePrizeCards.isNotEmpty) {
-          mutablePrizeCards.removeLast();
-        }
-        (data['playerPrizeCards'] as Map)[opponentId] = mutablePrizeCards;
-
-        print(
-            'DEBUG TIMEOUT: Setting opponent prize count to: $newOpponentPrizeCount');
-
-        // Add timeout message to activity log
-        final currentActivityLog = List<String>.from(
-            (data['activityLog'] as List? ?? []).cast<String>());
-        currentActivityLog
-            .add('$playerId timed out - $opponentId gets prize card!');
-        data['activityLog'] = currentActivityLog;
-
-        // Add timeout penalty marker - but now it means "opponent benefited"
-        final timeoutId = DateTime.now().millisecondsSinceEpoch.toString();
-        data['lastTimeoutPenalty'] = {
-          'timeoutPlayer': playerId, // Player who timed out
-          'benefitPlayer': opponentId, // Player who got the prize card
-          'timestamp': DateTime.now().millisecondsSinceEpoch,
-          'id': timeoutId,
-        };
-
-        // Switch turn to opponent
-        data['turn'] = opponentId;
-
-        print('DEBUG TIMEOUT: Transaction data prepared successfully');
-        return Transaction.success(data);
-      });
-
-      if (result.committed) {
-        print('DEBUG TIMEOUT: Transaction committed successfully');
-      } else {
-        print('DEBUG TIMEOUT: Transaction failed to commit');
-        throw Exception('Transaction failed to commit');
+    final result = await roomRef.runTransaction((Object? current) {
+      if (current == null) {
+        return Transaction.abort();
       }
-    } catch (e) {
-      print('DEBUG TIMEOUT: Error updating timeout penalty: $e');
-      rethrow;
+
+      final data = current as Map<dynamic, dynamic>;
+      final currentTurn = data['turn'] as String?;
+      final currentGameState = data['gameState'] as String?;
+
+      if (currentTurn != playerId || currentGameState == 'gameOver') {
+        return Transaction.abort();
+      }
+
+      // Initialize nested maps if they don't exist
+      data['prizeCardCounts'] ??= {};
+      data['playerPrizeCards'] ??= {};
+      data['activityLog'] ??= [];
+
+      // Get current OPPONENT prize count (opponent should get a prize card)
+      final currentOpponentPrizeCount =
+          (data['prizeCardCounts'] as Map)[opponentId] as int? ?? 3;
+
+      // Decrease OPPONENT's prize card count (they draw a prize card - get closer to winning)
+      final newOpponentPrizeCount =
+          (currentOpponentPrizeCount > 0) ? currentOpponentPrizeCount - 1 : 0;
+      (data['prizeCardCounts'] as Map)[opponentId] = newOpponentPrizeCount;
+
+      // Update the OPPONENT's prize cards list
+      final currentOpponentPrizeCards =
+          (data['playerPrizeCards'] as Map)[opponentId] as List<dynamic>? ??
+              List.generate(currentOpponentPrizeCount, (_) => 'cardback');
+
+      // Create a mutable copy to avoid fixed-length list error
+      final mutablePrizeCards = List<dynamic>.from(currentOpponentPrizeCards);
+
+      if (mutablePrizeCards.isNotEmpty) {
+        mutablePrizeCards.removeLast();
+      }
+      (data['playerPrizeCards'] as Map)[opponentId] = mutablePrizeCards;
+
+      // Add timeout message to activity log
+      final currentActivityLog = List<String>.from(
+          (data['activityLog'] as List? ?? []).cast<String>());
+      currentActivityLog
+          .add('$playerId timed out - $opponentId gets prize card!');
+      data['activityLog'] = currentActivityLog;
+
+      // Add timeout penalty marker
+      final timeoutId = DateTime.now().millisecondsSinceEpoch.toString();
+      data['lastTimeoutPenalty'] = {
+        'timeoutPlayer': playerId,
+        'benefitPlayer': opponentId,
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+        'id': timeoutId,
+      };
+
+      // FIX: Check if opponent won due to timeout
+      if (newOpponentPrizeCount == 0) {
+        // Opponent wins! Set game over state
+        data['gameState'] = 'gameOver';
+        data['winner'] = opponentId;
+        data['winnerMessage'] = 'Opponent wins!';
+        data['rematchRequests'] = {};
+        
+        // Get win streaks and update them
+        final winStreaksData = data['winStreaks'] as Map<dynamic, dynamic>? ?? {};
+        final opponentCurrentStreak = winStreaksData[opponentId] as int? ?? 0;
+        
+        // Initialize winStreaks if not present
+        data['winStreaks'] ??= {};
+        (data['winStreaks'] as Map)[opponentId!] = opponentCurrentStreak + 1;
+        (data['winStreaks'] as Map)[playerId!] = 0;
+      } else {
+        // Game continues - switch turn to opponent
+        data['turn'] = opponentId;
+      }
+
+      return Transaction.success(data);
+    });
+
+    if (result.committed) {
+      // FIX: Update local win streaks immediately if game ended
+      final snapshot = await roomRef.get();
+      if (snapshot.exists) {
+        final data = snapshot.value as Map<dynamic, dynamic>;
+        final gameState = data['gameState'] as String?;
+        
+        if (gameState == 'gameOver') {
+          final winStreaksData = data['winStreaks'] as Map<dynamic, dynamic>? ?? {};
+          setState(() {
+            for (var entry in winStreaksData.entries) {
+              multiplayerWinStreaks[entry.key as String] = entry.value as int? ?? 0;
+            }
+            
+            // FIX: Also update the local winStreak variable for UI display
+            if (playerId != null && multiplayerWinStreaks.containsKey(playerId)) {
+              winStreak = multiplayerWinStreaks[playerId]!;
+              _checkAndUpdateHighScore();
+            }
+          });
+        }
+      }
+    } else {
+      throw Exception('Transaction failed to commit');
     }
+  } catch (e) {
+    rethrow;
   }
+}
 
   void handleOpponentTimeout() {
     // This method should only be called in AI mode
@@ -3107,13 +3141,13 @@ Widget buildHighScore({required bool isMobile}) {
                 fontWeight: FontWeight.bold,
                 fontSize: 18,
                 letterSpacing: 1.1,
-                fontFamily: 'Roboto',
+                fontFamily: 'Balatro',
               ),
             ),
             content: const Text(
               '1 or 14?',
               textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white70, fontSize: 15),
+              style: TextStyle(color: Colors.white70, fontSize: 15, fontFamily: 'Balatro'),
             ),
             actionsAlignment: MainAxisAlignment.spaceEvenly,
             actions: [
@@ -3142,6 +3176,7 @@ Widget buildHighScore({required bool isMobile}) {
                     fontWeight: FontWeight.bold,
                     fontSize: 24, // Increased from 16
                     letterSpacing: 1.2,
+                    fontFamily: 'Balatro',
                   ),
                 ),
               ),
@@ -3170,6 +3205,7 @@ Widget buildHighScore({required bool isMobile}) {
                     fontWeight: FontWeight.bold,
                     fontSize: 24, // Increased from 16
                     letterSpacing: 1.2,
+                    fontFamily: 'Balatro',
                   ),
                 ),
               ),
@@ -3237,7 +3273,6 @@ Widget buildHighScore({required bool isMobile}) {
           return;
         }
       } catch (e) {
-        print('Error validating turn: $e');
         return;
       }
     }
@@ -3289,8 +3324,6 @@ Widget buildHighScore({required bool isMobile}) {
     selectedIndices.removeWhere((i) => i < 0 || i >= playerHand.length);
 
     if (!isSelectionValidForPlay()) {
-      print(
-          'Invalid selection: $selectedIndices for playerHand of length ${playerHand.length}');
       clearSelections();
       return;
     }
@@ -3302,7 +3335,6 @@ Widget buildHighScore({required bool isMobile}) {
     turnTimer?.cancel();
 
     if (!isPlayerTurn || gameOver) {
-      print('Game state changed during ace selection, canceling play');
       clearSelections();
       return;
     }
@@ -3313,7 +3345,6 @@ Widget buildHighScore({required bool isMobile}) {
 
     if (selectedIndices.isEmpty ||
         selectedIndices.length != originalIndices.length) {
-      print('Selections became invalid during ace selection');
       clearSelections();
       return;
     }
@@ -3357,8 +3388,6 @@ Widget buildHighScore({required bool isMobile}) {
       if (index >= 0 && index < playerHand.length) {
         validatedIndices.add(index);
       } else {
-        print(
-            'ERROR: Index $index is invalid for playerHand length ${playerHand.length}');
         clearSelections();
         return;
       }
@@ -3457,7 +3486,6 @@ Widget buildHighScore({required bool isMobile}) {
       if (playerPrizeCards.isNotEmpty) {
         HapticFeedback.mediumImpact();
         playerPrizeCards.removeLast();
-        print('Point won! Remaining: ${playerPrizeCards.length}');
         playPrizeCardSound();
         // Trigger shine animation on winning card
         setState(() {
@@ -3523,7 +3551,6 @@ Widget buildHighScore({required bool isMobile}) {
 
     // CRITICAL FIX: Add recursion prevention using class variable
     if (_isOpponentTurnRunning) {
-      print('WARNING: Opponent turn already running, preventing infinite loop');
       return;
     }
     _isOpponentTurnRunning = true;
@@ -3531,7 +3558,6 @@ Widget buildHighScore({required bool isMobile}) {
     try {
       // SAFETY: Validate opponent has cards
       if (opponentActualHand.isEmpty) {
-        print('SAFETY: Opponent has no cards, ending turn');
         setState(() {
           message = "Opponent has no cards left!";
           isPlayerTurn = true;
@@ -3541,10 +3567,6 @@ Widget buildHighScore({required bool isMobile}) {
       }
 
       // BULLETPROOF AI LOGIC STARTS HERE
-      print('=== AI TURN START ===');
-      print('AI Hand: $opponentActualHand');
-      print('Field: $field');
-      print('Field Ace Value: $fieldAceValue');
 
       // Simple difficulty-based win chance
       double winChance;
@@ -3607,7 +3629,6 @@ Widget buildHighScore({required bool isMobile}) {
               activityLog.add('Opponent rewound the field!');
               activityLogColor = Colors.orange;
             });
-            print('AI used Rewind modifier');
           }
         }
 
@@ -3632,7 +3653,6 @@ Widget buildHighScore({required bool isMobile}) {
               activityLog.add('Opponent drew an extra card!');
               activityLogColor = Colors.orange;
             });
-            print('AI used Draw1 modifier');
           }
         }
 
@@ -3647,7 +3667,6 @@ Widget buildHighScore({required bool isMobile}) {
             Random().nextDouble() < 0.3) {
           aiModifierToUse =
               calcModifiers[Random().nextInt(calcModifiers.length)];
-          print('AI selected modifier: $aiModifierToUse');
         }
       }
 
@@ -3914,7 +3933,6 @@ Widget buildHighScore({required bool isMobile}) {
         }
       }
 
-      print('Found ${validPlays.length} valid plays');
 
       // STEP 3: Choose the best play
       Map<String, dynamic>? chosenPlay;
@@ -3923,13 +3941,9 @@ Widget buildHighScore({required bool isMobile}) {
         // Sort by score (higher is better)
         validPlays.sort((a, b) => b['score'].compareTo(a['score']));
         chosenPlay = validPlays.first;
-        print(
-            'AI chose strategic play: ${chosenPlay['cards']} with modifier: ${chosenPlay['modifier']}');
       } else if (validPlays.isNotEmpty && !shouldTryToWin) {
         // Sometimes play suboptimally on purpose
         chosenPlay = validPlays[Random().nextInt(validPlays.length)];
-        print(
-            'AI chose random valid play: ${chosenPlay['cards']} with modifier: ${chosenPlay['modifier']}');
       } else {
         // FALLBACK: Play first card (this should rarely happen)
         chosenPlay = {
@@ -3941,7 +3955,6 @@ Widget buildHighScore({required bool isMobile}) {
           'score': 0.0,
           'modifier': null,
         };
-        print('AI using fallback: ${chosenPlay['cards']}');
       }
 
       // STEP 4: Execute the chosen play
@@ -3975,10 +3988,12 @@ Widget buildHighScore({required bool isMobile}) {
         if (cardsToPlay.length > 1) {
           // Reorder so largest value goes first (game rule: highest value first)
           List<double> values = [];
+          int aceOverrideIdx = 0; // Separate counter for ace overrides
           for (int i = 0; i < cardsToPlay.length; i++) {
             String card = cardsToPlay[i];
-            if (card == 'a' && i < aceOverrides.length) {
-              values.add(aceOverrides[i].toDouble());
+            if (card == 'a' && aceOverrideIdx < aceOverrides.length) {
+              values.add(aceOverrides[aceOverrideIdx].toDouble());
+              aceOverrideIdx++;
             } else {
               values.add(cardValue(card));
             }
@@ -4010,6 +4025,9 @@ Widget buildHighScore({required bool isMobile}) {
         // Add to field
         field.addAll(cardsToPlay);
 
+        // Trigger splash animation for opponent
+        //_showCardSplash = true;
+
         // Set ace value if needed
         if (field.isNotEmpty && field.last == 'a') {
           fieldAceValue = aceOverrides.isNotEmpty ? aceOverrides.last : 14;
@@ -4019,12 +4037,14 @@ Widget buildHighScore({required bool isMobile}) {
 
         // Create activity log message
         String playDescription = 'Opp played ';
+        int aceOverrideIdx = 0; // Separate counter for ace overrides
         for (int i = 0; i < cardsToPlay.length; i++) {
           String card = cardsToPlay[i];
           String cardDisplay;
 
-          if (card == 'a' && i < aceOverrides.length) {
-            cardDisplay = aceOverrides[i].toString();
+          if (card == 'a' && aceOverrideIdx < aceOverrides.length) {
+            cardDisplay = aceOverrides[aceOverrideIdx].toString();
+            aceOverrideIdx++;
           } else {
             cardDisplay = cardValue(card).toString().replaceAll('.0', '');
           }
@@ -4043,47 +4063,64 @@ Widget buildHighScore({required bool isMobile}) {
 
         activityLog.add(playDescription);
         playCardSound();
-
-        // Handle scoring
-        bool isFirstPlay = field.length == cardsToPlay.length;
-
-        if (isFirstPlay) {
-          // First play - no prize
-          activityLogColor = Colors.white;
-        } else if (isValidPlay) {
-          // Valid strategic play - AI gets prize card
-          activityLogColor = Colors.redAccent;
-          if (opponentPrizeCards.isNotEmpty) {
-            opponentPrizeCards.removeLast();
-            playPrizeCardSound();
-          }
-        } else {
-          // Invalid play - no prize
-          activityLogColor = Colors.white;
+      });
+      
+      Future.delayed(const Duration(milliseconds: 350), () {
+        if (mounted) {
+          setState(() {
+            _showCardSplash = false;
+          });
         }
+      });
 
-        // Replenish AI hand
-        while (opponentActualHand.length < 2 &&
-            opponentActualDrawPile.isNotEmpty) {
-          opponentActualHand.add(opponentActualDrawPile.removeAt(0));
+      // Handle scoring
+      bool isFirstPlay = field.length == cardsToPlay.length;
+
+      if (isFirstPlay) {
+        // First play - no prize
+        activityLogColor = Colors.white;
+      } else if (isValidPlay) {
+        // Valid strategic play - AI gets prize card
+        activityLogColor = Colors.redAccent;
+        if (opponentPrizeCards.isNotEmpty) {
+          opponentPrizeCards.removeLast();
+          playPrizeCardSound();
+          // Trigger opponent win shine animation
+          _showOpponentWinShine = true;
+          Future.delayed(const Duration(milliseconds: 800), () {
+            if (mounted) {
+              setState(() {
+                _showOpponentWinShine = false;
+              });
+            }
+          });
         }
-        while (opponentHand.length < 2) {
-          opponentHand.add('cardback');
-        }
+      } else {
+        // Invalid play - no prize
+        activityLogColor = Colors.white;
+      }
 
-        // Check win condition
-        checkForWin();
-        if (gameOver) return;
+      // Replenish AI hand
+      while (opponentActualHand.length < 2 &&
+          opponentActualDrawPile.isNotEmpty) {
+        opponentActualHand.add(opponentActualDrawPile.removeAt(0));
+      }
+      while (opponentHand.length < 2) {
+        opponentHand.add('cardback');
+      }
 
-        // End turn
+      // Check win condition
+      checkForWin();
+      if (gameOver) return;
+
+      // End turn
+      setState(() {
         isPlayerTurn = true;
         message = "Your turn!";
       });
 
       startTimer();
-      print('=== AI TURN END ===');
     } catch (e) {
-      print('ERROR in opponentTurn: $e');
       if (mounted) {
         setState(() {
           isPlayerTurn = true;
@@ -4120,8 +4157,6 @@ Widget buildHighScore({required bool isMobile}) {
 
   void toggleCardSelection(int index) {
     if (index < 0 || index >= playerHand.length) {
-      print(
-          'Invalid card selection index: $index (hand length: ${playerHand.length})');
       return;
     }
 
@@ -4149,7 +4184,6 @@ Widget buildHighScore({required bool isMobile}) {
       }
 
       if (selectedOps.length != (selectedIndices.length - 1).clamp(0, 2)) {
-        print('Emergency fix: ops length mismatch');
         selectedOps.clear();
         for (int i = 0; i < selectedIndices.length - 1; i++) {
           selectedOps.add('+');
@@ -4158,10 +4192,49 @@ Widget buildHighScore({required bool isMobile}) {
     });
   }
 
+void handleSwipeUpToPlay(int index) {
+  if (!isPlayerTurn || gameOver || index < 0 || index >= playerHand.length) {
+    return;
+  }
+
+  // Add Firebase turn validation for multiplayer
+  if (gameMode == 'human' && roomCode != null) {
+    FirebaseDatabase.instance
+        .ref('rooms/$roomCode/turn')
+        .get()
+        .then((snapshot) {
+      final currentTurn = snapshot.value as String?;
+      if (currentTurn != playerId) {
+        setState(() {
+          message = "Not your turn!";
+        });
+        return;
+      }
+
+      // Proceed with instant play
+      _instantPlayCard(index);
+    }).catchError((e) {
+      return;
+    });
+  } else {
+    // AI mode - play immediately
+    _instantPlayCard(index);
+  }
+}
+
+void _instantPlayCard(int index) async {
+  HapticFeedback.lightImpact();
+
+  // Set the selection internally WITHOUT triggering visual feedback
+  selectedIndices = [index];
+  selectedOps = [];
+
+  // Play the card immediately without setState (no visual selection)
+  await playSelectedCards();
+}
+
   void toggleOperation(int opIndex) {
     if (opIndex < 0 || opIndex >= selectedOps.length) {
-      print(
-          'Invalid operation index: $opIndex (selectedOps length: ${selectedOps.length})');
       return;
     }
 
@@ -4188,32 +4261,47 @@ Widget buildHighScore({required bool isMobile}) {
   }
 
   Widget buildModifierCards({required bool isMobile, bool isSmallPhone = false}) {
-    if (gameOver || showInitialOverlay) return const SizedBox.shrink();
-
-    if (playerAvailableModifiers.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        for (int i = 0; i < playerAvailableModifiers.length && i < 3; i++) ...[
-          if (i > 0) SizedBox(width: isSmallPhone ? 6 : (isMobile ? 8 : 12)),
-          AnimatedModifierCard(
-            modifierType: playerAvailableModifiers[i],
-            tooltip: _getModifierTooltip(playerAvailableModifiers[i]),
-            used: playerModifiers[playerAvailableModifiers[i]] ?? false,
-            onTap: isPlayerTurn
-                ? () => _useModifier(playerAvailableModifiers[i])
-                : null,
-            isMobile: isMobile,
-            isSmallPhone: isSmallPhone,
-            isSelected: activePlayerModifier == playerAvailableModifiers[i],
-          ),
-        ],
-      ],
-    );
+  // FIX: Don't show modifiers during search or when waiting for opponent
+  if (gameOver || showInitialOverlay || isSearchingForGame || waitingForOpponent) {
+    return const SizedBox.shrink();
   }
+
+  if (playerAvailableModifiers.isEmpty) {
+    return const SizedBox.shrink();
+  }
+
+  return Row(
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+      for (int i = 0; i < playerAvailableModifiers.length && i < 3; i++) ...[
+        if (i > 0) SizedBox(width: isSmallPhone ? 6 : (isMobile ? 8 : 12)),
+        GestureDetector(
+  onVerticalDragEnd: (details) {
+    // Check if swipe was upward and fast enough
+    if (details.primaryVelocity != null &&
+        details.primaryVelocity! < -300 &&
+        isPlayerTurn &&
+        !gameOver &&
+        selectedIndices.isNotEmpty) {
+      _handleSwipeUpModifier(playerAvailableModifiers[i]);
+    }
+  },
+  child: AnimatedModifierCard(
+    modifierType: playerAvailableModifiers[i],
+    tooltip: _getModifierTooltip(playerAvailableModifiers[i]),
+    used: playerModifiers[playerAvailableModifiers[i]] ?? false,
+    onTap: isPlayerTurn
+        ? () => _useModifier(playerAvailableModifiers[i])
+        : null,
+    isMobile: isMobile,
+    isSmallPhone: isSmallPhone,
+    isSelected: activePlayerModifier == playerAvailableModifiers[i],
+  ),
+),
+      ],
+    ],
+  );
+}
 
 // Add these helper methods to get modifier symbols and tooltips
   String _getModifierSymbol(String modifier) {
@@ -4298,60 +4386,68 @@ Widget buildHighScore({required bool isMobile}) {
   }
 
   Widget buildOpponentModifierDisplay({required bool isMobile}) {
-    if (gameOver || showInitialOverlay) return const SizedBox.shrink();
-
-    // Ensure we have opponent available modifiers before displaying
-    if (opponentAvailableModifiers.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: List.generate(
-        opponentAvailableModifiers.length > 3
-            ? 3
-            : opponentAvailableModifiers.length,
-        (index) {
-          if (index >= opponentAvailableModifiers.length) {
-            return SizedBox.shrink();
-          }
-
-          String modifierKey = opponentAvailableModifiers[index];
-          String displaySymbol = _getModifierDisplaySymbol(modifierKey);
-          bool isUsed = opponentModifiers[modifierKey] ?? false;
-
-          return Row(
-            children: [
-              if (index > 0) SizedBox(width: 8),
-              _buildOpponentModifierIndicator(displaySymbol, isUsed),
-            ],
-          );
-        },
-      ),
-    );
+  // FIX: Don't show modifiers during search or when waiting for opponent
+  if (gameOver || showInitialOverlay || isSearchingForGame || waitingForOpponent) {
+    return const SizedBox.shrink();
   }
 
+  // Ensure we have opponent available modifiers before displaying
+  if (opponentAvailableModifiers.isEmpty) {
+    return const SizedBox.shrink();
+  }
+
+  return Row(
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: List.generate(
+      opponentAvailableModifiers.length > 3
+          ? 3
+          : opponentAvailableModifiers.length,
+      (index) {
+        if (index >= opponentAvailableModifiers.length) {
+          return SizedBox.shrink();
+        }
+
+        String modifierKey = opponentAvailableModifiers[index];
+        String displaySymbol = _getModifierDisplaySymbol(modifierKey);
+        bool isUsed = opponentModifiers[modifierKey] ?? false;
+
+        return Row(
+          children: [
+            if (index > 0) SizedBox(width: 8),
+            _buildOpponentModifierIndicator(displaySymbol, isUsed),
+          ],
+        );
+      },
+    ),
+  );
+}
+
   Widget _buildModifierCard(String symbol, String tooltip, bool used,
-      {VoidCallback? onTap,
-      required bool isMobile,
-      bool isSelected = false,
-      String? modifierType}) {
-    bool isDisabled = onTap == null;
-
-    // Get border color
-    Color borderColor = used
-        ? Colors.grey[600]!
-        : (isSelected
-            ? const Color.fromARGB(247, 0, 255, 229) // border when selected
-            : (isDisabled
-                ? const Color.fromARGB(100, 134, 158, 255)
-                : const Color.fromARGB(255, 134, 158, 255)));
-
-    return Tooltip(
-      message: used ? '$tooltip (Used)' : tooltip,
-      child: GestureDetector(
-        onTap: onTap,
-        child: Opacity(
+    {VoidCallback? onTap,
+    required bool isMobile,
+    bool isSelected = false,
+    String? modifierType}) {
+  bool isDisabled = onTap == null;
+  
+  // ... existing code ...
+  
+  return Tooltip(
+    message: used ? '$tooltip (Used)' : tooltip,
+    child: GestureDetector(
+      onTap: onTap,
+      onVerticalDragEnd: (details) {
+        // Check if swipe was upward and fast enough
+        if (details.primaryVelocity != null &&
+            details.primaryVelocity! < -300 &&
+            modifierType != null &&
+            !used &&
+            isPlayerTurn &&
+            !gameOver &&
+            selectedIndices.isNotEmpty) { // Must have cards selected
+          _handleSwipeUpModifier(modifierType);
+        }
+      },
+      child: Opacity(
           opacity: used ? 0.3 : (isDisabled ? 0.6 : 0.95),
           child: Container(
             width: isMobile ? 50 : 60,
@@ -4359,7 +4455,7 @@ Widget buildHighScore({required bool isMobile}) {
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(8),
               border: Border.all(
-                color: borderColor,
+                color: const Color.fromARGB(255, 134, 158, 255),
                 width: isSelected ? 3 : 2, // Thicker border when selected
               ),
               boxShadow: [
@@ -4523,40 +4619,88 @@ Widget buildHighScore({required bool isMobile}) {
       );
 
       if (i < selectedIndices.length - 1 && i < selectedOps.length) {
-        widgets.add(
-          GestureDetector(
-            onTap: () => toggleOperation(i),
-            child: Container(
-              margin: EdgeInsets.symmetric(horizontal: opSpacing),
-              padding: EdgeInsets.symmetric(
-                horizontal: isSmallPhone ? 2 : (isMobile ? 4 : 8),
-                vertical: isSmallPhone ? 2 : (isMobile ? 4 : 8),
+  widgets.add(
+    GestureDetector(
+      onTap: () => toggleOperation(i),
+      onVerticalDragEnd: (details) async {
+        // Check if it's player's turn and game is active
+        if (!isPlayerTurn || gameOver || selectedIndices.isEmpty) return;
+        
+        // Add Firebase turn validation for multiplayer
+        if (gameMode == 'human' && roomCode != null) {
+          try {
+            final snapshot = await FirebaseDatabase.instance
+                .ref('rooms/$roomCode/turn')
+                .get();
+            final currentTurn = snapshot.value as String?;
+            
+            if (currentTurn != playerId) {
+              setState(() {
+                message = "Not your turn!";
+              });
+              return;
+            }
+          } catch (e) {
+            return;
+          }
+        }
+
+        // Determine swipe direction
+        if (details.primaryVelocity != null && details.primaryVelocity!.abs() > 300) {
+          HapticFeedback.lightImpact();
+          
+          if (details.primaryVelocity! < 0) {
+            // Swipe UP - keep current operator and submit
+            await playSelectedCards();
+          } else {
+            // Swipe DOWN - toggle operator first, then submit
+            setState(() {
+              selectedOps[i] = selectedOps[i] == '+' ? '-' : '+';
+            });
+            
+            // Small delay for visual feedback
+            await Future.delayed(const Duration(milliseconds: 100));
+            
+            // Auto-submit with the new operator
+            await playSelectedCards();
+          }
+        }
+      },
+      child: Container(
+        margin: EdgeInsets.symmetric(horizontal: opSpacing),
+        padding: EdgeInsets.symmetric(
+          horizontal: 0,
+          vertical: isSmallPhone ? 2 : (isMobile ? 4 : 8),
+        ),
+        decoration: BoxDecoration(
+          color: Colors.black,
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: Colors.greenAccent, width: 2),
+        ),
+        alignment: Alignment.center,
+        constraints: BoxConstraints(
+    minWidth: isSmallPhone ? 40 : (isMobile ? 50 : 60),  // Give it a minimum width
+  ),
+        child: Text(
+          selectedOps[i],
+          style: TextStyle(
+            fontFamily: 'Balatro',
+            fontSize: isSmallPhone ? 32 : (isMobile ? 48 : (isTablet ? 48 : 60)),
+            color: const Color.fromARGB(255, 104, 255, 210),
+            fontWeight: FontWeight.bold,
+            shadows: const [
+              Shadow(
+                blurRadius: 4,
+                color: Color.fromARGB(255, 218, 251, 255),
+                offset: Offset(0, 0),
               ),
-              decoration: BoxDecoration(
-                color: Colors.black,
-                borderRadius: BorderRadius.circular(4),
-                border: Border.all(color: Colors.greenAccent, width: 2),
-              ),
-              child: Text(
-                selectedOps[i],
-                style: TextStyle(
-                  fontFamily: 'Courier',
-                  fontSize: isSmallPhone ? 32 : (isMobile ? 48 : (isTablet ? 48 : 60)),
-                  color: const Color.fromARGB(255, 104, 255, 210),
-                  fontWeight: FontWeight.bold,
-                  shadows: const [
-                    Shadow(
-                      blurRadius: 4,
-                      color: Color.fromARGB(255, 218, 251, 255),
-                      offset: Offset(0, 0),
-                    ),
-                  ],
-                ),
-              ),
-            ),
+            ],
           ),
-        );
-      }
+        ),
+      ),
+    ),
+  );
+}
     }
 
     if (isPlayerTurn && !gameOver) {
@@ -4592,6 +4736,7 @@ Widget buildHighScore({required bool isMobile}) {
           'Quick Play',
           style: TextStyle(
             color: Color.fromARGB(255, 0, 188, 212),
+            fontFamily: 'Balatro',
             fontSize: 24,
             fontWeight: FontWeight.bold,
           ),
@@ -4603,6 +4748,7 @@ Widget buildHighScore({required bool isMobile}) {
               : 'Searching for game...',
           style: const TextStyle(
             color: Colors.white70,
+            fontFamily: 'Balatro',
             fontSize: 14,
           ),
         ),
@@ -4671,7 +4817,7 @@ Widget buildHighScore({required bool isMobile}) {
                   fontWeight: FontWeight.bold,
                   fontSize: isMobile ? 11 : 13,
                   letterSpacing: 0.8,
-                  fontFamily: 'Roboto',
+                  fontFamily: 'Balatro',
                 ),
               ),
             ],
@@ -4715,6 +4861,7 @@ Widget buildHighScore({required bool isMobile}) {
                   'Versus Mode',
                   style: TextStyle(
                     color: Color.fromARGB(255, 92, 96, 255),
+                    fontFamily: 'Balatro',
                     fontSize: 24,
                     fontWeight: FontWeight.bold,
                   ),
@@ -4750,6 +4897,7 @@ Widget buildHighScore({required bool isMobile}) {
                       Text(
                         'Quick Play',
                         style: TextStyle(
+                          fontFamily: 'Balatro',
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
                         ),
@@ -4773,6 +4921,7 @@ Widget buildHighScore({required bool isMobile}) {
                         'or use a room code',
                         style: TextStyle(
                           color: Colors.white38,
+                          fontFamily: 'Balatro',
                           fontSize: 12,
                         ),
                       ),
@@ -4797,7 +4946,7 @@ Widget buildHighScore({required bool isMobile}) {
                           minimumSize: const Size(0, 44),
                         ),
                         onPressed: _createRoom,
-                        child: const Text('Create'),
+                        child: const Text('Create', style: TextStyle(fontFamily: 'Balatro')),
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -4814,7 +4963,7 @@ Widget buildHighScore({required bool isMobile}) {
                             showRoomSelection = false;
                           });
                         },
-                        child: const Text('Join'),
+                        child: const Text('Join', style: TextStyle(fontFamily: 'Balatro')),
                       ),
                     ),
                   ],
@@ -4824,7 +4973,7 @@ Widget buildHighScore({required bool isMobile}) {
                   onPressed: _cancelRoomSelection,
                   child: const Text(
                     'Cancel',
-                    style: TextStyle(color: Colors.white54),
+                    style: TextStyle(color: Colors.white54, fontFamily: 'Balatro'),
                   ),
                 ),
               ],
@@ -4868,6 +5017,7 @@ Widget buildHighScore({required bool isMobile}) {
                     color: Color.fromARGB(255, 255, 64, 129),
                     fontSize: 24,
                     fontWeight: FontWeight.bold,
+                    fontFamily: 'Balatro',
                   ),
                 ),
                 const SizedBox(height: 24),
@@ -4879,6 +5029,7 @@ Widget buildHighScore({required bool isMobile}) {
                       fontSize: 20,
                       fontWeight: FontWeight.bold,
                       letterSpacing: 2,
+                      fontFamily: 'Balatro',
                     ),
                   ),
                   const SizedBox(height: 16),
@@ -4888,7 +5039,7 @@ Widget buildHighScore({required bool isMobile}) {
                   const SizedBox(height: 16),
                   const Text(
                     'Waiting for opponent...',
-                    style: TextStyle(color: Color.fromARGB(179, 237, 239, 240)),
+                    style: TextStyle(color: Color.fromARGB(179, 237, 239, 240), fontFamily: 'Balatro'),
                   ),
                   const SizedBox(height: 24),
                   TextButton(
@@ -4897,7 +5048,7 @@ Widget buildHighScore({required bool isMobile}) {
                     },
                     child: const Text(
                       'Cancel',
-                      style: TextStyle(color: Colors.white54),
+                      style: TextStyle(color: Colors.white54, fontFamily: 'Balatro'),
                     ),
                   ),
                 ] else ...[
@@ -4920,7 +5071,7 @@ Widget buildHighScore({required bool isMobile}) {
                     },
                     child: const Text(
                       'Back',
-                      style: TextStyle(color: Colors.white54),
+                      style: TextStyle(color: Colors.white54, fontFamily: 'Balatro'),
                     ),
                   ),
                 ],
@@ -5000,7 +5151,7 @@ Widget buildHighScore({required bool isMobile}) {
                       _joinRoom(roomCodeController.text.trim());
                     }
                   },
-                  child: const Text('Join'),
+                  child: const Text('Join', style: TextStyle(fontFamily: 'Balatro')),
                 ),
                 const SizedBox(height: 16),
                 TextButton(
@@ -5034,8 +5185,12 @@ Widget buildHighScore({required bool isMobile}) {
     final isSmallPhone = screenWidth < 360;
     final isMobile = screenWidth < 600;
     final isTablet = screenWidth >= 600 && screenWidth < 1024;
+    final isDesktop = screenWidth >= 1024;
     final isLandscape = screenWidth > screenHeight && screenHeight < 500;
     final isShortScreen = screenHeight < 600 || isLandscape;
+    
+    // Max width for desktop to keep game centered and phone-like
+    final maxGameWidth = isDesktop ? 500.0 : double.infinity;
     
     // Dynamic scaling factor based on screen width (normalized to Pixel 7's 412px)
     final screenScale = (screenWidth / 412).clamp(0.8, 1.3);
@@ -5074,37 +5229,43 @@ Widget buildHighScore({required bool isMobile}) {
         child: Stack(
           children: [
             Positioned.fill(
-              child: AnimatedSwitcher(
-                duration: Duration(milliseconds: 1500),
-                transitionBuilder: (Widget child, Animation<double> animation) {
-                  return FadeTransition(
-                    opacity: animation,
-                    child: child,
-                  );
-                },
-                child: Transform.scale(
-                  scale: 4.5,
-                  child: Image.asset(
-                    backgrounds[currentBackgroundIndex],
-                    key: ValueKey(backgrounds[currentBackgroundIndex]),
-                    fit: BoxFit.cover,
-                    alignment: Alignment.center,
+  child: AnimatedSwitcher(
+    duration: Duration(milliseconds: 1500),
+    transitionBuilder: (Widget child, Animation<double> animation) {
+      return FadeTransition(
+        opacity: animation,
+        child: RepaintBoundary(child: child), // Add this wrapper
+      );
+    },
+    child: RepaintBoundary( // And this one
+      child: Transform.scale(
+        scale: 4.5,
+        child: Image.asset(
+          backgrounds[currentBackgroundIndex],
+          key: ValueKey(backgrounds[currentBackgroundIndex]),
+          fit: BoxFit.cover,
+          alignment: Alignment.center,
+        ),
+      ),
+    ),
+  ),
+),
+            // Center game content with max width on desktop
+            Center(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: maxGameWidth),
+                child: Padding(
+                  padding: EdgeInsets.all(
+                    isMobile ? 16.0 : (isTablet ? 20.0 : 24.0),
                   ),
-                ),
-              ),
-            ),
-            Padding(
-              padding: EdgeInsets.all(
-                isMobile ? 16.0 : (isTablet ? 20.0 : 24.0),
-              ),
-              child: Column(
-                children: [
-                  Flexible(
-                    child: SingleChildScrollView(
-                      child: Padding(
-                        padding: EdgeInsets.only(
-                          top: isShortScreen ? 60 : (isMobile ? 85 : 95),
-                          bottom: isShortScreen ? 4 : (isMobile ? 8 : 16),
+                  child: Column(
+                    children: [
+                      Flexible(
+                        child: SingleChildScrollView(
+                          child: Padding(
+                            padding: EdgeInsets.only(
+                              top: isShortScreen ? 60 : (isMobile ? 85 : 95),
+                              bottom: isShortScreen ? 4 : (isMobile ? 8 : 16),
                           left: 0,
                           right: 0,
                         ),
@@ -5253,7 +5414,7 @@ Widget buildHighScore({required bool isMobile}) {
                                                           : (isTablet ? 14 : 16),
                                                       height: 1.2,
                                                       fontWeight: FontWeight.w500,
-                                                      fontFamily: 'Roboto',
+                                                      fontFamily: 'Balatro',
                                                     ),
                                                   )
                                                 : const SizedBox.shrink(key: ValueKey('empty')),
@@ -5262,57 +5423,75 @@ Widget buildHighScore({required bool isMobile}) {
                                       : const SizedBox.shrink(),
                                 ),
                                 Stack(
-                                  clipBehavior: Clip.none,
-                                  children: [
-                                    AnimatedSwitcher(
-                                      duration: const Duration(milliseconds: 330),
-                                      transitionBuilder: (Widget child,
-                                          Animation<double> animation) {
-                                        return FadeTransition(
-                                          opacity: animation,
-                                          child: ScaleTransition(
-                                            scale:
-                                                Tween<double>(begin: 0.95, end: 1.0)
-                                                    .animate(animation),
-                                            child: child,
-                                          ),
-                                        );
-                                      },
-                                      child: field.isNotEmpty
-                                          ? Container(
-                                              key: ValueKey(field.last),
-                                              width: fieldCardWidth,
-                                              height: fieldCardHeight,
-                                              decoration: BoxDecoration(
-                                                borderRadius:
-                                                    BorderRadius.circular(8),
-                                                boxShadow: [
-                                                  BoxShadow(
-                                                    color: Colors.black
-                                                        .withOpacity(0.4),
-                                                    blurRadius: 8,
-                                                    offset: const Offset(2, 4),
-                                                    spreadRadius: 1,
-                                                  ),
-                                                ],
-                                              ),
-                                              child: CardWidget(
-                                                value: field.last,
-                                                isJoker: field.last == 'jkr',
-                                              ),
-                                            )
-                                          : const SizedBox.shrink(),
-                                    ),
-                                    // Prize win shine animation
-                                    if (_showPrizeWinShine && field.isNotEmpty)
-                                      Positioned.fill(
-                                        child: _PrizeWinShine(
-                                          width: fieldCardWidth,
-                                          height: fieldCardHeight,
-                                        ),
-                                      ),
-                                  ],
-                                ),
+  clipBehavior: Clip.none,
+  children: [
+    AnimatedSwitcher(
+      duration: const Duration(milliseconds: 330),
+      transitionBuilder: (Widget child,
+          Animation<double> animation) {
+        return FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(
+            scale:
+                Tween<double>(begin: 0.95, end: 1.0)
+                    .animate(animation),
+            child: child,
+          ),
+        );
+      },
+      child: field.isNotEmpty
+          ? Container(
+              key: ValueKey(field.last),
+              width: fieldCardWidth,
+              height: fieldCardHeight,
+              decoration: BoxDecoration(
+                borderRadius:
+                    BorderRadius.circular(8),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black
+                        .withOpacity(0.4),
+                    blurRadius: 8,
+                    offset: const Offset(2, 4),
+                    spreadRadius: 1,
+                  ),
+                ],
+              ),
+              child: CardWidget(
+                value: field.last,
+                isJoker: field.last == 'jkr',
+              ),
+            )
+          : const SizedBox.shrink(),
+    ),
+    // Card splash effect
+    if (_showCardSplash && field.isNotEmpty)
+      Positioned.fill(
+        child: Center(
+          child: _CardSplashEffect(
+            width: fieldCardWidth,
+            height: fieldCardHeight,
+          ),
+        ),
+      ),
+    // Prize win shine animation (player wins)
+    if (_showPrizeWinShine && field.isNotEmpty)
+      Positioned.fill(
+        child: _PrizeWinShine(
+          width: fieldCardWidth,
+          height: fieldCardHeight,
+        ),
+      ),
+    // Opponent win shine animation (dark grey)
+    if (_showOpponentWinShine && field.isNotEmpty)
+      Positioned.fill(
+        child: _OpponentWinShine(
+          width: fieldCardWidth,
+          height: fieldCardHeight,
+        ),
+      ),
+  ],
+),
                                 Expanded(
                                   flex: isMobile ? 1 : 2,
                                   child: Row(
@@ -5338,74 +5517,80 @@ Widget buildHighScore({required bool isMobile}) {
                               screenScale: screenScale,
                             ),
 // Player hand with turn indicator
-                            _TurnIndicatorContainer(
-                              isPlayerTurn: isPlayerTurn && !gameOver,
-                              child: Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children:
-                                    List.generate(playerHand.length, (index) {
-                                  String cardValue = playerHand[index];
-                                  bool isSelected =
-                                      selectedIndices.contains(index);
-                                  bool isInteractive = isPlayerTurn && !gameOver;
-                                  return GestureDetector(
-                                    onTap: isInteractive
-                                        ? () => toggleCardSelection(index)
-                                        : null,
-                                    child: AnimatedContainer(
-                                      duration: const Duration(milliseconds: 150),
-                                      curve: Curves.easeOutCubic,
-                                      transform: Matrix4.translationValues(
-                                        0,
-                                        isSelected ? -12 : 0,
-                                        0,
-                                      ),
-                                      child: AnimatedScale(
-                                        scale: isSelected ? 1.05 : 1.0,
-                                        duration: const Duration(milliseconds: 150),
-                                        curve: Curves.easeOutCubic,
-                                        child: AnimatedOpacity(
-                                          duration: const Duration(milliseconds: 200),
-                                          opacity: isInteractive ? 1.0 : 0.5,
-                                          child: AnimatedContainer(
-                                            duration: const Duration(milliseconds: 150),
-                                            decoration: BoxDecoration(
-                                              borderRadius: BorderRadius.circular(8),
-                                              border: Border.all(
-                                                color: isSelected
-                                                    ? const Color.fromARGB(200, 100, 180, 255)
-                                                    : Colors.transparent,
-                                                width: isSelected ? 2.5 : 0,
-                                              ),
-                                              boxShadow: [
-                                                BoxShadow(
-                                                  color: isSelected
-                                                      ? const Color.fromARGB(60, 100, 180, 255)
-                                                      : Colors.black.withOpacity(0.4),
-                                                  blurRadius: isSelected ? 16 : 8,
-                                                  offset: Offset(2, isSelected ? 8 : 4),
-                                                  spreadRadius: isSelected ? 2 : 1,
-                                                ),
-                                              ],
-                                            ),
-                                            margin: EdgeInsets.symmetric(
-                                                horizontal: horizontalCardSpacing),
-                                            child: SizedBox(
-                                              width: playerCardWidth,
-                                              height: playerCardHeight,
-                                              child: CardWidget(
-                                                value: cardValue,
-                                                isJoker: cardValue == 'jkr',
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  );
-                                }),
-                              ),
-                            ),
+_TurnIndicatorContainer(
+  isPlayerTurn: isPlayerTurn && !gameOver,
+  child: Row(
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: List.generate(playerHand.length, (index) {
+      String cardValue = playerHand[index];
+      bool isSelected = selectedIndices.contains(index);
+      bool isInteractive = isPlayerTurn && !gameOver;
+      
+      return GestureDetector(
+        onTap: isInteractive ? () => toggleCardSelection(index) : null,
+        onVerticalDragEnd: isInteractive
+            ? (details) {
+                // Check if swipe was upward and fast enough
+                if (details.primaryVelocity != null &&
+                    details.primaryVelocity! < -300) {
+                  handleSwipeUpToPlay(index);
+                }
+              }
+            : null,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          curve: Curves.easeOutCubic,
+          transform: Matrix4.translationValues(
+            0,
+            isSelected ? -12 : 0,
+            0,
+          ),
+          child: AnimatedScale(
+            scale: isSelected ? 1.05 : 1.0,
+            duration: const Duration(milliseconds: 150),
+            curve: Curves.easeOutCubic,
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 200),
+              opacity: isInteractive ? 1.0 : 0.5,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: isSelected
+                        ? const Color.fromARGB(200, 100, 180, 255)
+                        : Colors.transparent,
+                    width: isSelected ? 2.5 : 0,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: isSelected
+                          ? const Color.fromARGB(60, 100, 180, 255)
+                          : Colors.black.withOpacity(0.4),
+                      blurRadius: isSelected ? 16 : 8,
+                      offset: Offset(2, isSelected ? 8 : 4),
+                      spreadRadius: isSelected ? 2 : 1,
+                    ),
+                  ],
+                ),
+                margin: EdgeInsets.symmetric(
+                    horizontal: horizontalCardSpacing),
+                child: SizedBox(
+                  width: playerCardWidth,
+                  height: playerCardHeight,
+                  child: CardWidget(
+                    value: cardValue,
+                    isJoker: cardValue == 'jkr',
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }),
+  ),
+),
                             SizedBox(height: verticalSpacingSmall),
 // Player prize cards - animate only when a new game starts (keyed by session ID)
                             Row(
@@ -5460,6 +5645,8 @@ Widget buildHighScore({required bool isMobile}) {
                 ],
               ),
             ),
+          ),
+        ),
             if (gameOver)
               Positioned.fill(
                 child: _GameOverOverlay(
@@ -5538,7 +5725,8 @@ Widget buildHighScore({required bool isMobile}) {
                   child: const Text(
                     'Play',
                     style: TextStyle(
-                      fontSize: 18,
+                      fontFamily: 'Balatro',
+                      fontSize: 19,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
@@ -5565,6 +5753,7 @@ Widget buildHighScore({required bool isMobile}) {
                           style: TextStyle(
                             color: const Color.fromARGB(
                                 192, 242, 244, 255),
+                            fontFamily: 'Balatro',
                             fontSize: 14,
                             fontWeight: FontWeight.w500,
                             decoration: TextDecoration.underline,
@@ -5620,8 +5809,6 @@ Widget buildHighScore({required bool isMobile}) {
                               _buildRuleItem(
                                   'Add or subtract your cards for strategic plays'),
                               const SizedBox(height: 8),
-                              _buildRuleItemWithLink('Learn more!',
-                                  'https://docs.google.com/document/d/e/2PACX-1vSfJARnFyszfTiIxJC9iXQ2JIERtpgm5RDEu8cWfdPXF2QQfB_rKDYpadIPZ90iDjUjyugVi66m4-V5/pub'),
                             ],
                           ),
                         )
@@ -5765,6 +5952,7 @@ Widget buildHighScore({required bool isMobile}) {
               color: Colors.white.withOpacity(0.9),
               fontSize: 14,
               height: 1.4,
+              fontFamily: 'Balatro',
             ),
           ),
         ),
@@ -5797,7 +5985,6 @@ Widget _buildRuleItemWithLink(String text, String url) {
                 webOnlyWindowName: '_blank',
               );
             } catch (e) {
-              print('Error launching URL: $e');
             }
           },
           child: Text(
@@ -5897,7 +6084,7 @@ class _AnalogPaperTimerState extends State<AnalogPaperTimer>
                 child: AnimatedDefaultTextStyle(
                   duration: const Duration(milliseconds: 200),
                   style: TextStyle(
-                    fontFamily: 'DSEG7Classic',
+                    fontFamily: 'Balatro',
                     fontSize: widget.size * 0.30,
                     color: isUrgent 
                         ? const Color.fromARGB(255, 200, 60, 60)
@@ -5928,82 +6115,16 @@ class _AnalogPaperTimerState extends State<AnalogPaperTimer>
   }
 }
 
-class FloatingPrizeCard extends StatefulWidget {
+class FloatingPrizeCard extends StatelessWidget {
   final Widget child;
   final int index;
 
   const FloatingPrizeCard({super.key, required this.child, this.index = 0});
 
   @override
-  State<FloatingPrizeCard> createState() => _FloatingPrizeCardState();
-}
-
-class _FloatingPrizeCardState extends State<FloatingPrizeCard>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-  late Animation<double> _animation;
-  Timer? _animationTimer;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      duration: const Duration(seconds: 3),
-      vsync: this,
-    );
-
-    _animation = Tween<double>(
-      begin: 0,
-      end: 1.0,
-    ).animate(CurvedAnimation(
-      parent: _controller,
-      curve: Curves.easeInOut,
-    ));
-
-    _startAnimationCycle();
-  }
-
-  void _startAnimationCycle() {
-    _controller.repeat(reverse: true);
-
-    _animationTimer = Timer(const Duration(seconds: 4), () {
-      _controller.stop();
-
-      _controller
-          .animateTo(0.0, duration: const Duration(milliseconds: 600))
-          .then((_) {
-        _animationTimer = Timer(const Duration(seconds: 6), () {
-          if (mounted) {
-            _startAnimationCycle();
-          }
-        });
-      });
-    });
-  }
-
-  @override
-  void dispose() {
-    _animationTimer?.cancel();
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _animation,
-      builder: (context, child) {
-        double phaseOffset = (widget.index * 0.33) % 1.0;
-        double animationValue = _animation.value;
-        double offsetValue = animationValue *
-            sin((animationValue / 4) * 2 * pi + (phaseOffset * 2 * pi)) * 2;
-
-        return Transform.translate(
-          offset: Offset(0, offsetValue),
-          child: widget.child,
-        );
-      },
-    );
+    // Floating animation removed - just return the child
+    return child;
   }
 }
 
@@ -6529,6 +6650,7 @@ class _GameOverOverlayState extends State<_GameOverOverlay>
                           isWin ? 'Victory!' : 'Game Over!',
                           style: TextStyle(
                             color: accentColor,
+                            fontFamily: 'Balatro',
                             fontSize: 48,
                             fontWeight: FontWeight.bold,
                             letterSpacing: 1.5,
@@ -6667,6 +6789,7 @@ class _AnimatedPressButtonState extends State<_AnimatedPressButton>
               child: Text(
                 widget.waitingForRematch ? 'Waiting for opponent...' : 'Next Game',
                 style: const TextStyle(
+                  fontFamily: 'Balatro',
                   fontWeight: FontWeight.bold,
                   fontSize: 16,
                 ),
@@ -6870,21 +6993,23 @@ class _PlayButtonState extends State<_PlayButton>
                 ),
                 onPressed: widget.onPressed,
                 child: Text(
-                  '=',
-                  style: TextStyle(
-                    fontFamily: 'Courier',
-                    fontSize: widget.isSmallPhone ? 32 : (widget.isMobile ? 46 : (widget.isTablet ? 32 : 36)),
-                    color: widget.canPlay
-                        ? const Color.fromARGB(255, 237, 227, 240)
-                        : const Color.fromARGB(100, 237, 227, 240),
-                    fontWeight: FontWeight.bold,
-                    shadows: [
-                      Shadow(
-                        blurRadius: widget.canPlay ? 8 : 4,
-                        color: widget.canPlay
-                            ? const Color.fromARGB(222, 219, 242, 255)
-                            : const Color.fromARGB(100, 219, 242, 255),
-                        offset: const Offset(0, 0),
+  '=',
+  textAlign: TextAlign.center,
+  style: TextStyle(
+    fontFamily: 'Balatro',
+    fontSize: widget.isSmallPhone ? 28 : (widget.isMobile ? 42 : (widget.isTablet ? 28 : 34)),
+    color: widget.canPlay
+        ? const Color.fromARGB(255, 237, 227, 240)
+        : const Color.fromARGB(100, 237, 227, 240),
+    fontWeight: FontWeight.bold,
+    height: 1.0,  // Add this to remove extra line height
+    shadows: [
+      Shadow(
+        blurRadius: widget.canPlay ? 8 : 4,
+        color: widget.canPlay
+            ? const Color.fromARGB(222, 219, 242, 255)
+            : const Color.fromARGB(100, 219, 242, 255),
+        offset: const Offset(0, 0),
                       ),
                     ],
                   ),
@@ -7097,6 +7222,117 @@ class _ShinePainter extends CustomPainter {
       oldDelegate.position != position;
 }
 
+// Dark shine animation that plays when opponent wins a prize (doubles/halves successfully)
+class _OpponentWinShine extends StatefulWidget {
+  final double width;
+  final double height;
+
+  const _OpponentWinShine({
+    required this.width,
+    required this.height,
+  });
+
+  @override
+  State<_OpponentWinShine> createState() => _OpponentWinShineState();
+}
+
+class _OpponentWinShineState extends State<_OpponentWinShine>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _shinePosition;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 675), // 10% faster than player shine
+      vsync: this,
+    );
+
+    _shinePosition = Tween<double>(begin: -0.5, end: 1.5).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeOut),
+    );
+
+    _controller.forward();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: SizedBox(
+            width: widget.width,
+            height: widget.height,
+            child: CustomPaint(
+              painter: _OpponentShinePainter(position: _shinePosition.value),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _OpponentShinePainter extends CustomPainter {
+  final double position;
+
+  _OpponentShinePainter({required this.position});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final shineWidth = size.width * 0.6;
+    final shineCenter = size.width * position;
+
+    final paint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
+        colors: [
+          Colors.transparent,
+          Colors.grey.shade800.withOpacity(0.2),
+          Colors.grey.shade600.withOpacity(0.7),
+          Colors.grey.shade400.withOpacity(0.5), // Dark grey center
+          Colors.grey.shade600.withOpacity(0.7),
+          Colors.grey.shade800.withOpacity(0.2),
+          Colors.transparent,
+        ],
+        stops: const [0.0, 0.15, 0.4, 0.5, 0.6, 0.85, 1.0],
+      ).createShader(Rect.fromLTWH(
+        shineCenter - shineWidth / 2,
+        0,
+        shineWidth,
+        size.height,
+      ));
+
+    // Draw the shine as a rotated rectangle
+    canvas.save();
+    canvas.translate(shineCenter, size.height / 2);
+    canvas.rotate(-0.3);
+    canvas.drawRect(
+      Rect.fromCenter(
+        center: Offset.zero,
+        width: shineWidth,
+        height: size.height * 1.8,
+      ),
+      paint,
+    );
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _OpponentShinePainter oldDelegate) =>
+      oldDelegate.position != position;
+}
+
 class _SearchArcPainter extends CustomPainter {
   final double progress;
 
@@ -7124,6 +7360,160 @@ class _SearchArcPainter extends CustomPainter {
       oldDelegate.progress != progress;
 }
 
+// Pixelated 8-bit splash animation
+class _CardSplashEffect extends StatefulWidget {
+  final double width;
+  final double height;
+
+  const _CardSplashEffect({
+    required this.width,
+    required this.height,
+  });
+
+  @override
+  State<_CardSplashEffect> createState() => _CardSplashEffectState();
+}
+
+class _CardSplashEffectState extends State<_CardSplashEffect>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _scaleAnimation;
+  late Animation<double> _opacityAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 350),
+      vsync: this,
+    );
+
+    _scaleAnimation = Tween<double>(begin: 0.3, end: 1.8).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeOut),
+    );
+
+    _opacityAnimation = Tween<double>(begin: 1.0, end: 0.0).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: const Interval(0.3, 1.0, curve: Curves.easeOut),
+      ),
+    );
+
+    _controller.forward();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        return Opacity(
+          opacity: _opacityAnimation.value,
+          child: CustomPaint(
+            size: Size(widget.width * 2, widget.height * 2),
+            painter: _PixelSplashPainter(
+              progress: _scaleAnimation.value,
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// Custom painter for pixelated 8-bit splash
+class _PixelSplashPainter extends CustomPainter {
+  final double progress;
+
+  _PixelSplashPainter({required this.progress});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final pixelSize = 8.0; // Size of each "pixel" block
+    final maxRadius = size.width * 0.4 * progress;
+    
+    // Create pixelated rings
+    final colors = [
+      const Color.fromARGB(255, 255, 255, 255),
+      const Color.fromARGB(255, 100, 180, 255),
+      const Color.fromARGB(255, 64, 150, 255),
+      const Color.fromARGB(255, 40, 120, 230),
+    ];
+
+    // Draw 4 expanding pixelated rings
+    for (int ring = 0; ring < 4; ring++) {
+      final ringRadius = maxRadius * (0.4 + ring * 0.2);
+      final ringColor = colors[ring % colors.length];
+      
+      // Calculate number of pixels around the ring
+      final circumference = 2 * pi * ringRadius;
+      final pixelCount = (circumference / (pixelSize * 1.5)).floor();
+      
+      for (int i = 0; i < pixelCount; i++) {
+        final angle = (i / pixelCount) * 2 * pi;
+        final x = center.dx + ringRadius * cos(angle);
+        final y = center.dy + ringRadius * sin(angle);
+        
+        // Add some randomness to make it more 8-bit style
+        final offset = (i % 3 == 0) ? pixelSize * 0.3 : 0.0;
+        
+        final paint = Paint()
+          ..color = ringColor.withOpacity(1.0 - progress * 0.5)
+          ..style = PaintingStyle.fill;
+        
+        // Draw square "pixels"
+        canvas.drawRect(
+          Rect.fromCenter(
+            center: Offset(x + offset, y),
+            width: pixelSize,
+            height: pixelSize,
+          ),
+          paint,
+        );
+      }
+    }
+    
+    // Add central bright pixel cluster
+    final centralPixels = [
+      Offset(0, 0),
+      Offset(-pixelSize, 0),
+      Offset(pixelSize, 0),
+      Offset(0, -pixelSize),
+      Offset(0, pixelSize),
+      Offset(-pixelSize, -pixelSize),
+      Offset(pixelSize, -pixelSize),
+      Offset(-pixelSize, pixelSize),
+      Offset(pixelSize, pixelSize),
+    ];
+    
+    final centralPaint = Paint()
+      ..color = Colors.white.withOpacity((1.0 - progress) * 0.8)
+      ..style = PaintingStyle.fill;
+    
+    for (var offset in centralPixels) {
+      canvas.drawRect(
+        Rect.fromCenter(
+          center: center + offset,
+          width: pixelSize,
+          height: pixelSize,
+        ),
+        centralPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _PixelSplashPainter oldDelegate) =>
+      oldDelegate.progress != progress;
+}
+
 class _PaperTimerPainter extends CustomPainter {
   final int secondsLeft;
   final int totalSeconds;
@@ -7134,6 +7524,7 @@ class _PaperTimerPainter extends CustomPainter {
     required this.totalSeconds,
     this.isUrgent = false,
   });
+
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -7158,6 +7549,7 @@ class _PaperTimerPainter extends CustomPainter {
       paint,
     );
   }
+
 
   @override
   bool shouldRepaint(covariant _PaperTimerPainter oldDelegate) => 
