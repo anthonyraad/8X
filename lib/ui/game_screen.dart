@@ -33,6 +33,9 @@ class _GameScreenState extends State<GameScreen> {
   List<String> activityLog = [];
   Set<String> processedTimeoutPenalties = <String>{};
 
+String selectedCardback = 'cardback'; // Current cardback asset name
+List<String> availableCardbacks = ['cardback']; // List of unlocked cardbacks
+
 // Firebase multiplayer variables
   String gameMode = 'ai'; // 'ai' or 'human'
   bool showRoomSelection = false;
@@ -5218,52 +5221,71 @@ void _instantPlayCard(int index) async {
   }
 
   @override
-  Widget build(BuildContext context) {
-    final screenSize = MediaQuery.of(context).size;
-    final screenWidth = screenSize.width;
-    final screenHeight = screenSize.height;
-    
-    // Improved responsive breakpoints
-    final isSmallPhone = screenWidth < 360;
-    final isMobile = screenWidth < 600;
-    final isTablet = screenWidth >= 600 && screenWidth < 1024;
-    final isDesktop = screenWidth >= 1024;
-    final isLandscape = screenWidth > screenHeight && screenHeight < 500;
-    final isShortScreen = screenHeight < 600 || isLandscape;
-    
-    // Max width for desktop to keep game centered and phone-like
-    final maxGameWidth = isDesktop ? 500.0 : double.infinity;
-    
-    // Dynamic scaling factor based on screen width (normalized to Pixel 7's 412px)
-    final screenScale = (screenWidth / 412).clamp(0.8, 1.3);
-    
-    // Responsive card dimensions
-    final playerCardWidth = isMobile 
-        ? (isSmallPhone ? 65.0 : 80.0 * screenScale).clamp(60.0, 85.0)
-        : (isTablet ? 60.0 : 75.0);
-    final playerCardHeight = playerCardWidth * 1.31; // Maintain aspect ratio
-    
-    final prizeCardWidth = isMobile
-        ? (isSmallPhone ? 45.0 : 55.0 * screenScale).clamp(42.0, 60.0)
-        : (isTablet ? 55.0 : 70.0);
-    final prizeCardHeight = prizeCardWidth * 1.4;
-    
-    final fieldCardWidth = isMobile
-        ? (isSmallPhone ? 60.0 : 75.0 * screenScale).clamp(55.0, 80.0)
-        : (isTablet ? 65.0 : 80.0);
-    final fieldCardHeight = fieldCardWidth * 1.4;
-    
-    final opponentCardWidth = isMobile
-        ? (isSmallPhone ? 45.0 : 55.0 * screenScale).clamp(42.0, 60.0)
-        : (isTablet ? 55.0 : 70.0);
-    final opponentCardHeight = opponentCardWidth * 1.4;
-    
-    // Responsive spacing
-    final verticalSpacingSmall = isShortScreen ? 4.0 : (isMobile ? 8.0 : 12.0);
-    final verticalSpacingMedium = isShortScreen ? 8.0 : (isMobile ? 16.0 : 32.0);
-    final horizontalCardSpacing = isSmallPhone ? 2.0 : (isMobile ? 4.0 : 8.0);
+Widget build(BuildContext context) {
+  final screenSize = MediaQuery.of(context).size;
+  final screenWidth = screenSize.width;
+  final screenHeight = screenSize.height;
+  
+  // Improved responsive breakpoints
+  final isSmallPhone = screenWidth < 360;
+  final isMobile = screenWidth < 600;
+  final isTablet = screenWidth >= 600 && screenWidth < 1024;
+  final isDesktop = screenWidth >= 1024;
+  final isLandscape = screenWidth > screenHeight && screenHeight < 500;
+  final isShortScreen = screenHeight < 600 || isLandscape;
+  
+  // NEW: Detect mobile web on wide screens (browser on laptop/desktop)
+  // This is when screen is wide but aspect ratio suggests mobile viewport
+  final isMobileWebOnWideScreen = screenWidth >= 600 && 
+                                    screenHeight < 900 && 
+                                    screenWidth / screenHeight > 1.3;
+  
+  // Max width for desktop AND mobile web on wide screens to keep game centered and phone-like
+  final maxGameWidth = (isDesktop || isMobileWebOnWideScreen) ? 500.0 : double.infinity;
+  
+  // Dynamic scaling factor based on screen width (normalized to Pixel 7's 412px)
+  final screenScale = (screenWidth / 412).clamp(0.8, 1.3);
+  
+  // NEW: Reduce vertical spacing on mobile web wide screens to prevent overlap
+  final verticalSpacingSmall = isMobileWebOnWideScreen 
+      ? 3.0 
+      : (isShortScreen ? 4.0 : (isMobile ? 8.0 : 12.0));
+  final verticalSpacingMedium = isMobileWebOnWideScreen 
+      ? 6.0 
+      : (isShortScreen ? 8.0 : (isMobile ? 16.0 : 32.0));
+  
+  // Responsive card dimensions - smaller on mobile web wide screens
+  final playerCardWidth = isMobileWebOnWideScreen
+      ? 65.0
+      : (isMobile 
+          ? (isSmallPhone ? 65.0 : 80.0 * screenScale).clamp(60.0, 85.0)
+          : (isTablet ? 60.0 : 75.0));
+  final playerCardHeight = playerCardWidth * 1.31;
+  
+  final prizeCardWidth = isMobileWebOnWideScreen
+      ? 42.0
+      : (isMobile
+          ? (isSmallPhone ? 45.0 : 55.0 * screenScale).clamp(42.0, 60.0)
+          : (isTablet ? 55.0 : 70.0));
+  final prizeCardHeight = prizeCardWidth * 1.4;
+  
+  final fieldCardWidth = isMobileWebOnWideScreen
+      ? 60.0
+      : (isMobile
+          ? (isSmallPhone ? 60.0 : 75.0 * screenScale).clamp(55.0, 80.0)
+          : (isTablet ? 65.0 : 80.0));
+  final fieldCardHeight = fieldCardWidth * 1.4;
+  
+  final opponentCardWidth = isMobileWebOnWideScreen
+      ? 42.0
+      : (isMobile
+          ? (isSmallPhone ? 45.0 : 55.0 * screenScale).clamp(42.0, 60.0)
+          : (isTablet ? 55.0 : 70.0));
+  final opponentCardHeight = opponentCardWidth * 1.4;
+  
+  final horizontalCardSpacing = isSmallPhone ? 2.0 : (isMobile ? 4.0 : 8.0);
 
-    return Scaffold(
+  return Scaffold(
       appBar: null,
       extendBodyBehindAppBar: true,
       extendBody: true,
