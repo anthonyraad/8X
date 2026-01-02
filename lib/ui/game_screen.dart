@@ -56,7 +56,8 @@ class _GameScreenState extends State<GameScreen> {
     'assets/images/playmat1.png',
     'assets/images/playmat2.png',
     'assets/images/playmat3.png',
-    'assets/images/playmat4.png'
+    'assets/images/playmat4.png',
+    'assets/images/playmat5.png'
   ];
   int currentBackgroundIndex = 0;
   bool isTransitioning = false;
@@ -182,6 +183,7 @@ class _GameScreenState extends State<GameScreen> {
   final AudioPlayer _audioPlayer = AudioPlayer();
   final AudioPlayer _tapAudioPlayer = AudioPlayer();
   final AudioPlayer _gameOverAudioPlayer = AudioPlayer();
+  final AudioPlayer _oppWinAudioPlayer = AudioPlayer();
 
   int? fieldAceValue;
 
@@ -1141,10 +1143,13 @@ void _checkAndUpdateHighScore() {
           if (opponentPrizeCards.length != opponentPrizeCount) {
 
             // Only play prize sound if opponent legitimately won a prize (not penalty)
-            if (opponentWonPrize) {
-              Future.delayed(const Duration(milliseconds: 100), () {
-                playPrizeCardSound();
-              });
+if (opponentWonPrize) {
+  // Only play sound if opponent still has prize cards left (not the final one)
+  if (opponentPrizeCount > 0) {
+    Future.delayed(const Duration(milliseconds: 100), () {
+      playOpponentPrizeCardSound();
+    });
+  }
               // Trigger opponent win shine animation for multiplayer
               _showOpponentWinShine = true;
               Future.delayed(const Duration(milliseconds: 800), () {
@@ -1902,6 +1907,7 @@ void _checkAndUpdateHighScore() {
     _audioPlayer.dispose();
     _gameOverAudioPlayer.dispose();
     _tapAudioPlayer.dispose();
+    _oppWinAudioPlayer.dispose();
     super.dispose();
   }
 
@@ -2758,6 +2764,9 @@ void _handleSwipeUpModifier(String modifierType) async {
 
   if (playerPrizeCards.isEmpty) {
     HapticFeedback.mediumImpact();
+    // ADDED: Stop any currently playing sounds before game over sound
+    _audioPlayer.stop();
+
     setState(() {
       message = "You win!";
       isPlayerTurn = false;
@@ -2851,6 +2860,14 @@ void _handleSwipeUpModifier(String modifierType) async {
     } catch (e) {
     }
   }
+
+Future<void> playOpponentPrizeCardSound() async {
+  try {
+    await _oppWinAudioPlayer.stop();
+    await _oppWinAudioPlayer.play(AssetSource('sounds/oppwinplay.mp3'));
+  } catch (e) {
+  }
+}
 
   Future<void> playGameWinSound() async {
     try {
@@ -2968,11 +2985,14 @@ void _handleSwipeUpModifier(String modifierType) async {
       });
     } else if (!gameOver && gameMode == 'ai') {
       // AI mode - opponent (AI) gets a prize card when human times out
-      if (opponentPrizeCards.isNotEmpty) {
-        opponentPrizeCards.removeLast();
-        playPrizeCardSound();
-        checkForWin();
-      }
+if (opponentPrizeCards.isNotEmpty) {
+  opponentPrizeCards.removeLast();
+  // Only play sound if opponent still has prize cards left (not the final one)
+  if (opponentPrizeCards.isNotEmpty) {
+    playOpponentPrizeCardSound();
+  }
+  checkForWin();
+}
       isPlayerTurn = false;
       Future.delayed(const Duration(seconds: 1), opponentTurn);
     }
@@ -3482,15 +3502,18 @@ void _handleSwipeUpModifier(String modifierType) async {
       activityLogColor = Colors.white;
       safeDrawCards(playerHand, playerDrawPile, 2);
     } else if (isValidMove) {
-      activityLogColor = Colors.greenAccent;
-      if (playerPrizeCards.isNotEmpty) {
-        HapticFeedback.mediumImpact();
-        playerPrizeCards.removeLast();
-        playPrizeCardSound();
-        // Trigger shine animation on winning card
-        setState(() {
-          _showPrizeWinShine = true;
-        });
+  activityLogColor = Colors.greenAccent;
+  if (playerPrizeCards.isNotEmpty) {
+    HapticFeedback.mediumImpact();
+    playerPrizeCards.removeLast();
+    // Only play sound if not the final prize card
+    if (playerPrizeCards.isNotEmpty) {
+      playPrizeCardSound();
+    }
+    // Trigger shine animation on winning card
+    setState(() {
+      _showPrizeWinShine = true;
+    });
         Future.delayed(const Duration(milliseconds: 800), () {
           if (mounted) {
             setState(() {
@@ -4081,10 +4104,13 @@ void _handleSwipeUpModifier(String modifierType) async {
         activityLogColor = Colors.white;
       } else if (isValidPlay) {
         // Valid strategic play - AI gets prize card
-        activityLogColor = Colors.redAccent;
-        if (opponentPrizeCards.isNotEmpty) {
-          opponentPrizeCards.removeLast();
-          playPrizeCardSound();
+activityLogColor = Colors.redAccent;
+if (opponentPrizeCards.isNotEmpty) {
+  opponentPrizeCards.removeLast();
+  // Only play sound if opponent still has prize cards left (not the final one)
+  if (opponentPrizeCards.isNotEmpty) {
+    playOpponentPrizeCardSound();
+  }
           // Trigger opponent win shine animation
           _showOpponentWinShine = true;
           Future.delayed(const Duration(milliseconds: 800), () {
@@ -5707,7 +5733,7 @@ _TurnIndicatorContainer(
                 SizedBox(height: isMobile ? 16 : 32),
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Color.fromARGB(255, 77, 104, 255),
+                    backgroundColor: Color.fromARGB(255, 95, 77, 255),
                     foregroundColor: Colors.white,
                     padding: const EdgeInsets.symmetric(
                       horizontal: 32,
