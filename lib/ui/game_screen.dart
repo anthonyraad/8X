@@ -933,7 +933,7 @@ void _checkAndUpdateHighScore() {
         field = List<String>.from(fieldData.cast<String>());
 
 // Play card sound when opponent plays (field grows and it wasn't my turn)
-        if (!wasMyTurn && !isPlayerTurn && field.length > previousFieldLength) {
+        if (!wasMyTurn && field.length > previousFieldLength) {
           Future.delayed(const Duration(milliseconds: 100), () {
             playCardSound();
           });
@@ -1141,34 +1141,50 @@ void _checkAndUpdateHighScore() {
             opponentHand = List.generate(opponentHandSize, (_) => 'cardback');
           }
           if (opponentPrizeCards.length != opponentPrizeCount) {
-
-            // Only play prize sound if opponent legitimately won a prize (not penalty)
-if (opponentWonPrize) {
-  // Only play sound if opponent still has prize cards left (not the final one)
-  if (opponentPrizeCount > 0) {
-    Future.delayed(const Duration(milliseconds: 100), () {
-      playOpponentPrizeCardSound();
-    });
-  }
-              // Trigger opponent win shine animation for multiplayer
-              _showOpponentWinShine = true;
-              Future.delayed(const Duration(milliseconds: 800), () {
-                if (mounted) {
-                  setState(() {
-                    _showOpponentWinShine = false;
-                  });
-                }
-              });
-            }
-
-            opponentPrizeCards =
-                List.generate(opponentPrizeCount, (_) => 'cardback');
-          }
-          if (opponentDrawPile.length != opponentDrawSize) {
-            opponentDrawPile =
-                List.generate(opponentDrawSize, (_) => 'cardback');
-          }
+// NEW: Handle player benefiting from opponent timeout
+    if (isOpponentTimeoutPenalty) {
+      // Player gets prize card due to opponent timeout - show WIN effects!
+      Future.delayed(const Duration(milliseconds: 100), () {
+        playPrizeCardSound(); // Use player's win sound
+      });
+      
+      // Trigger player win shine animation
+      _showPrizeWinShine = true;
+      Future.delayed(const Duration(milliseconds: 800), () {
+        if (mounted) {
+          setState(() {
+            _showPrizeWinShine = false;
+          });
         }
+      });
+    }
+    // Handle normal opponent wins
+    else if (opponentWonPrize) {
+      // Only play sound if opponent still has prize cards left (not the final one)
+      if (opponentPrizeCount > 0) {
+        Future.delayed(const Duration(milliseconds: 100), () {
+          playOpponentPrizeCardSound();
+        });
+      }
+      // Trigger opponent win shine animation for multiplayer
+      _showOpponentWinShine = true;
+      Future.delayed(const Duration(milliseconds: 800), () {
+        if (mounted) {
+          setState(() {
+            _showOpponentWinShine = false;
+          });
+        }
+      });
+    }
+
+    opponentPrizeCards =
+        List.generate(opponentPrizeCount, (_) => 'cardback');
+  }
+  if (opponentDrawPile.length != opponentDrawSize) {
+    opponentDrawPile =
+        List.generate(opponentDrawSize, (_) => 'cardback');
+  }
+}
 
         // FIXED: Critical turn management - only act on actual turn changes
         if (!gameOver) {
