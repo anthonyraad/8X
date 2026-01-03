@@ -5298,7 +5298,7 @@ Widget build(BuildContext context) {
     transitionBuilder: (Widget child, Animation<double> animation) {
       return FadeTransition(
         opacity: animation,
-        child: RepaintBoundary(child: child), // Add this wrapper
+        child: RepaintBoundary(child: child),
       );
     },
     child: RepaintBoundary( // And this one
