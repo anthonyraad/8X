@@ -35,6 +35,7 @@ class _GameScreenState extends State<GameScreen> {
 
 String selectedCardback = 'cardback'; // Current cardback asset name
 List<String> availableCardbacks = ['cardback']; // List of unlocked cardbacks
+  String cardbackChoice = 'Diamond'; // UI choice for dropdown (Diamond|Opal)
 
 // Firebase multiplayer variables
   String gameMode = 'ai'; // 'ai' or 'human'
@@ -60,14 +61,25 @@ List<String> availableCardbacks = ['cardback']; // List of unlocked cardbacks
     'assets/images/playmat2.png',
     'assets/images/playmat3.png',
     'assets/images/playmat4.png',
-    'assets/images/playmat5.png'
+    'assets/images/playmat5.png',
+    'assets/images/playmat6.png',
   ];
   int currentBackgroundIndex = 0;
   bool isTransitioning = false;
 
   int aiDifficulty = 1; // 1 = Easy, 2 = Medium, 3 = Hard
+  int defaultAiDifficulty = 1; // Default difficulty preference (1 = Dull, 2 = Keen, 3 = Sharp)
   int winStreak = 0;
   int highScore = 0;
+  int totalWins = 0;
+  bool unlockedOpal = false;
+  bool unlockedOnyx = false;
+  bool unlockedAmber = false;
+  bool unlockedAmethyst = false;
+
+  // Map of playerId -> cardback asset (for multiplayer to show opponent's selection)
+  Map<String, String> playerCardbackAssets = {};
+  String aiOpponentCardbackAsset = CardWidget.defaultCardBackAsset;
 
 
   bool isPlayerTurn = true;
@@ -81,6 +93,11 @@ List<String> availableCardbacks = ['cardback']; // List of unlocked cardbacks
   bool _waitingForRematch = false;
   bool _aceDialogOpen = false;
   bool _isOpponentTurnRunning = false;
+  bool showSettings = false;
+  bool volumeEnabled = true;
+  bool _hasEverConnected = false; // True once game has started with 2 players
+  bool _isIntentionallyLeaving = false; // True when user deliberately cancels/leaves
+  bool _isInitializingRematch = false; // True while host is initializing rematch to prevent double-processing
   
   // Multiplayer win streaks - tracks consecutive wins per player for timer reduction
   Map<String, int> multiplayerWinStreaks = {};
@@ -149,17 +166,16 @@ List<String> availableCardbacks = ['cardback']; // List of unlocked cardbacks
 
   String? appliedModifier;
 
-//Sanitize modifier keys for Firebase
+  // Sanitize modifier keys for Firebase
   Map<String, String> _sanitizeModifierKey(String modifier) {
-    // Convert problematic characters for Firebase keys
-    final Map<String, String> keyMapping = {
-      '-0.5': 'minusHalf',
-      '2x': 'double',
+    final keyMapping = {
+      '2x': 'twoTimes',
       '+3': 'plusThree',
       '-3': 'minusThree',
       '+1': 'plusOne',
       '-1': 'minusOne',
       '+11': 'plusEleven',
+      '-0.5': 'minusHalf', // CRITICAL: Must sanitize - Firebase doesn't allow '.' in keys
       'draw1': 'drawOne',
       'rewind': 'rewind',
       'mulligan': 'mulligan',
@@ -183,10 +199,89 @@ List<String> availableCardbacks = ['cardback']; // List of unlocked cardbacks
     return sanitizedModifier;
   }
 
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  final AudioPlayer _tapAudioPlayer = AudioPlayer();
-  final AudioPlayer _gameOverAudioPlayer = AudioPlayer();
-  final AudioPlayer _oppWinAudioPlayer = AudioPlayer();
+  late final AudioPlayer _audioPlayer;
+  late final AudioPlayer _tapAudioPlayer;
+  late final AudioPlayer _gameOverAudioPlayer;
+  late final AudioPlayer _oppWinAudioPlayer;
+
+  // Initialize audio context and players so they inherit the configured audio context
+  Future<void> _initAudioPlayers() async {
+    await _configureAudioSession();
+
+    // Create players after audio context is set so they don't request audio focus
+    _audioPlayer = AudioPlayer();
+    _tapAudioPlayer = AudioPlayer();
+    _gameOverAudioPlayer = AudioPlayer();
+    _oppWinAudioPlayer = AudioPlayer();
+
+    try {
+      // Prefer low-latency for tap sounds
+      await _tapAudioPlayer.setPlayerMode(PlayerMode.lowLatency);
+    } catch (e) {}
+
+    try {
+      // Avoid forcing a specific player mode for the main players to keep
+      // compatibility with the installed audioplayers version.
+      // The tap player uses low-latency mode above.
+    } catch (e) {}
+
+    // Apply current volume setting to newly created players
+    _applyVolumeSetting();
+
+    // Preload tap sound
+    await _preloadTapSound();
+  }
+
+  void _applyVolumeSetting() {
+    try {
+      final vol = volumeEnabled ? 1.0 : 0.0;
+      _audioPlayer.setVolume(vol);
+      _tapAudioPlayer.setVolume(vol);
+      _gameOverAudioPlayer.setVolume(vol);
+      _oppWinAudioPlayer.setVolume(vol);
+    } catch (e) {}
+  }
+
+  Future<void> _loadVolumeSetting() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getBool('volumeEnabled');
+      if (saved != null) {
+        setState(() {
+          volumeEnabled = saved;
+        });
+        _applyVolumeSetting();
+      }
+    } catch (e) {}
+  }
+
+  Future<void> _saveVolumeSetting() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('volumeEnabled', volumeEnabled);
+    } catch (e) {}
+  }
+
+  Future<void> _loadDefaultDifficulty() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getInt('defaultAiDifficulty');
+      if (saved != null) {
+        setState(() {
+          defaultAiDifficulty = saved;
+        });
+      }
+    } catch (e) {}
+  }
+
+  Future<void> _saveDefaultDifficulty() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('defaultAiDifficulty', defaultAiDifficulty);
+    } catch (e) {}
+  }
+
+  
 
   int? fieldAceValue;
 
@@ -212,6 +307,262 @@ Future<void> _saveHighScore(int score) async {
   }
 }
 
+// Load total wins from persistent storage
+Future<void> _loadTotalWins() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      totalWins = prefs.getInt('totalWinsSharp') ?? 0;
+    });
+  } catch (e) {
+    totalWins = 0;
+  }
+}
+
+// Save total wins to persistent storage
+Future<void> _saveTotalWins(int wins) async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('totalWinsSharp', wins);
+  } catch (e) {
+  }
+}
+
+// Load saved cardback choice from persistent storage
+Future<void> _loadCardbackChoice() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final choice = prefs.getString('cardbackChoice') ?? 'Diamond';
+    // Prefer a directly saved asset name if present so the exact asset is applied
+    final savedAsset = prefs.getString('selectedCardbackAsset');
+    setState(() {
+      cardbackChoice = choice;
+      if (savedAsset != null && savedAsset.isNotEmpty) {
+        CardWidget.defaultCardBackAsset = savedAsset;
+        // Derive selectedCardback token from asset filename
+        if (savedAsset.contains('cardback5')) {
+          selectedCardback = 'cardback5';
+          cardbackChoice = 'Opal';
+        } else if (savedAsset.contains('cardback4')) {
+          selectedCardback = 'cardback4';
+          cardbackChoice = 'Amethyst';
+        } else if (savedAsset.contains('cardback3')) {
+          selectedCardback = 'cardback3';
+          cardbackChoice = 'Amber';
+        } else if (savedAsset.contains('cardback2')) {
+          selectedCardback = 'cardback2';
+          cardbackChoice = 'Onyx';
+        } else {
+          selectedCardback = 'cardback';
+          cardbackChoice = 'Diamond';
+        }
+      } else {
+        if (choice == 'Opal') {
+          selectedCardback = 'cardback5';
+          CardWidget.defaultCardBackAsset = 'assets/images/cardback5.png';
+        } else if (choice == 'Amethyst') {
+          selectedCardback = 'cardback4';
+          CardWidget.defaultCardBackAsset = 'assets/images/cardback4.png';
+        } else if (choice == 'Amber') {
+          selectedCardback = 'cardback3';
+          CardWidget.defaultCardBackAsset = 'assets/images/cardback3.png';
+        } else if (choice == 'Onyx') {
+          selectedCardback = 'cardback2';
+          CardWidget.defaultCardBackAsset = 'assets/images/cardback2.png';
+        } else {
+          selectedCardback = 'cardback';
+          CardWidget.defaultCardBackAsset = 'assets/images/cardback.png';
+        }
+      }
+    });
+  } catch (e) {
+    // default stays as Diamond
+    cardbackChoice = 'Diamond';
+  }
+}
+
+// Ensure loaded cardback is allowed; fallback to Diamond if locked
+void _ensureCardbackUnlocked() async {
+  if ((cardbackChoice == 'Opal' && !unlockedOpal) || (cardbackChoice == 'Amethyst' && !unlockedAmethyst) || (cardbackChoice == 'Amber' && !unlockedAmber) || (cardbackChoice == 'Onyx' && !unlockedOnyx)) {
+    setState(() {
+      cardbackChoice = 'Diamond';
+      selectedCardback = 'cardback';
+      CardWidget.defaultCardBackAsset = 'assets/images/cardback.png';
+    });
+    await _saveCardbackChoice();
+  }
+}
+
+// Load unlocked cardbacks flags
+Future<void> _loadUnlockedCardbacks() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      unlockedOpal = prefs.getBool('unlockedOpal') ?? false;
+      unlockedOnyx = prefs.getBool('unlockedOnyx') ?? false;
+      unlockedAmber = prefs.getBool('unlockedAmber') ?? false;
+      unlockedAmethyst = prefs.getBool('unlockedAmethyst') ?? false;
+    });
+  } catch (e) {
+    unlockedOpal = false;
+    unlockedOnyx = false;
+    unlockedAmber = false;
+    unlockedAmethyst = false;
+  }
+}
+
+// Save unlocked cardbacks flags
+Future<void> _saveUnlockedCardbacks() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('unlockedOpal', unlockedOpal);
+    await prefs.setBool('unlockedOnyx', unlockedOnyx);
+    await prefs.setBool('unlockedAmber', unlockedAmber);
+    await prefs.setBool('unlockedAmethyst', unlockedAmethyst);
+  } catch (e) {}
+}
+
+// Check and unlock cardbacks based on high score thresholds
+void _unlockCardbacksIfNeeded() {
+  // Remember previous unlock state so we can detect newly unlocked items
+  final wasOpal = unlockedOpal;
+  final wasAmethyst = unlockedAmethyst;
+  final wasAmber = unlockedAmber;
+  final wasOnyx = unlockedOnyx;
+
+  bool changed = false;
+  // Update flags inside setState so the UI reflects unlocks immediately
+  setState(() {
+    if (!unlockedAmethyst && highScore >= 7) {
+      unlockedAmethyst = true;
+      changed = true;
+    }
+    if (!unlockedAmber && highScore >= 5) {
+      unlockedAmber = true;
+      changed = true;
+    }
+    if (!unlockedOnyx && highScore >= 3) {
+      unlockedOnyx = true;
+      changed = true;
+    }
+    if (!unlockedOpal && highScore >= 10) {
+      unlockedOpal = true;
+      changed = true;
+    }
+  });
+
+  if (changed) {
+    _saveUnlockedCardbacks();
+    if (mounted) {
+      // Show only the highest-priority newly unlocked cardback's snackbar.
+      // Priority: Opal (10) > Amethyst (7) > Amber (5) > Onyx (3)
+      if (!wasOpal && unlockedOpal) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Unlocked Opal cardback!', style: const TextStyle(fontFamily: 'Balatro')),
+            behavior: SnackBarBehavior.floating,
+            backgroundColor: Colors.black87,
+            margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            elevation: 6,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      } else if (!wasAmethyst && unlockedAmethyst) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Unlocked Amethyst cardback!', style: const TextStyle(fontFamily: 'Balatro')),
+            behavior: SnackBarBehavior.floating,
+            backgroundColor: Colors.black87,
+            margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            elevation: 6,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      } else if (!wasAmber && unlockedAmber) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Unlocked Amber cardback!', style: const TextStyle(fontFamily: 'Balatro')),
+            behavior: SnackBarBehavior.floating,
+            backgroundColor: Colors.black87,
+            margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            elevation: 6,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      } else if (!wasOnyx && unlockedOnyx) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Unlocked Onyx cardback!', style: const TextStyle(fontFamily: 'Balatro')),
+            behavior: SnackBarBehavior.floating,
+            backgroundColor: Colors.black87,
+            margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            elevation: 6,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    }
+  }
+}
+
+// Save cardback choice to persistent storage
+Future<void> _saveCardbackChoice() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('cardbackChoice', cardbackChoice);
+    // Also persist the selected asset so the exact cardback is applied on load
+    await prefs.setString('selectedCardbackAsset', CardWidget.defaultCardBackAsset);
+    // If in human multiplayer, publish our selected cardback asset so opponents can see it
+    if (gameMode == 'human' && roomCode != null && playerId != null) {
+      try {
+        final ref = FirebaseDatabase.instance.ref('rooms/$roomCode/playerSettings/$playerId');
+        print('DEBUG: Writing cardback to Firebase -> room: $roomCode player: $playerId asset: ${CardWidget.defaultCardBackAsset} choice: $cardbackChoice');
+        await ref.update({
+          'cardbackAsset': CardWidget.defaultCardBackAsset,
+          'choice': cardbackChoice,
+        });
+      } catch (e) {
+        print('DEBUG: Failed writing cardback to Firebase: $e');
+      }
+    }
+
+    // Immediately update local AI/opponent visuals so overlays reflect the
+    // newly selected cardback without requiring a restart or game reset.
+    try {
+      if (mounted) {
+        setState(() {
+          if (gameMode == 'ai' && aiDifficulty == 3) {
+            // For Sharp AI, match the player's cardback until 2 consecutive wins.
+            if (winStreak < 2) {
+              aiOpponentCardbackAsset = CardWidget.defaultCardBackAsset;
+            } else {
+              final projected = winStreak + 1;
+              if (projected >= 10) {
+                aiOpponentCardbackAsset = 'assets/images/cardback5.png';
+              } else if (projected >= 7) {
+                aiOpponentCardbackAsset = 'assets/images/cardback4.png';
+              } else if (projected >= 5) {
+                aiOpponentCardbackAsset = 'assets/images/cardback3.png';
+              } else if (projected >= 3) {
+                aiOpponentCardbackAsset = 'assets/images/cardback2.png';
+              } else {
+                aiOpponentCardbackAsset = CardWidget.defaultCardBackAsset;
+              }
+            }
+          } else {
+            // In other modes, reflect the player's current selection locally.
+            aiOpponentCardbackAsset = CardWidget.defaultCardBackAsset;
+          }
+        });
+      }
+    } catch (e) {
+      print('DEBUG: Failed to update local opponent cardback: $e');
+    }
+  } catch (e) {
+    print('DEBUG: _saveCardbackChoice error: $e');
+  }
+}
+
 // Check and update high score if current streak is higher
 void _checkAndUpdateHighScore() {
   if (winStreak > highScore) {
@@ -219,6 +570,7 @@ void _checkAndUpdateHighScore() {
       highScore = winStreak;
     });
     _saveHighScore(highScore);
+    _unlockCardbacksIfNeeded();
   }
 }
 
@@ -241,6 +593,9 @@ void _checkAndUpdateHighScore() {
 
     // Cancel any existing Firebase subscriptions
     gameSubscription?.cancel();
+    gameSubscription = null;
+    quickMatchSubscription?.cancel();
+    quickMatchSubscription = null;
 
     // Reset all game state
     _resetGameState();
@@ -257,6 +612,8 @@ void _checkAndUpdateHighScore() {
       waitingForOpponent = false;
       message = '';
       _waitingForRematch = false;
+      _hasEverConnected = false;
+      _isIntentionallyLeaving = false;
 
       // Clear selections
       clearSelections();
@@ -270,7 +627,9 @@ void _checkAndUpdateHighScore() {
     // Light preparation - don't use _prepareForMultiplayer() as it resets too much
     turnTimer?.cancel();
     gameSubscription?.cancel();
+    gameSubscription = null;
     quickMatchSubscription?.cancel();
+    quickMatchSubscription = null;
     
     setState(() {
       // Set up for quick match
@@ -283,10 +642,13 @@ void _checkAndUpdateHighScore() {
       gameMode = 'human'; // Set to human mode immediately
       connectionStatus = 'Searching for opponent...';
       gameOver = false;
+      _hasEverConnected = false;
+      _isIntentionallyLeaving = false;
     });
 
     try {
       _generatePlayerId();
+      print('DEBUG: Starting quick match search with playerId: $playerId');
       
       // Query specifically for quick match rooms (not room-code rooms)
       final DatabaseReference roomsRef = FirebaseDatabase.instance.ref('rooms');
@@ -296,6 +658,8 @@ void _checkAndUpdateHighScore() {
           .equalTo(true)
           .limitToFirst(20)
           .get();
+      
+      print('DEBUG: Query completed. snapshot.exists=${snapshot.exists}, value type=${snapshot.value?.runtimeType}');
 
 
       String? foundRoomCode;
@@ -304,34 +668,43 @@ void _checkAndUpdateHighScore() {
         final rooms = snapshot.value as Map<dynamic, dynamic>;
         final now = DateTime.now().millisecondsSinceEpoch;
         
+        print('DEBUG: Found ${rooms.length} quick match rooms to check');
+        
         // Find a suitable quick match room that's waiting for opponent
         for (var entry in rooms.entries) {
           final roomData = entry.value as Map<dynamic, dynamic>;
           final gameState = roomData['gameState'] as String?;
-          final createdAt = roomData['createdAt'] as int? ?? 0;
+          // Handle ServerValue.timestamp - it might be a map or an int
+          final createdAtRaw = roomData['createdAt'];
+          final createdAt = (createdAtRaw is int) ? createdAtRaw : 0;
           final host = roomData['host'] as String?;
           final players = roomData['players'] as Map<dynamic, dynamic>? ?? {};
           
-          
           // Room must be: waiting state, less than 2 minutes old, has 1 player, not ours
           final isWaiting = gameState == 'waiting';
-          final isRecent = (now - createdAt) < 120000; // 2 minutes
+          final isRecent = createdAt == 0 || (now - createdAt) < 120000; // 2 minutes (or if createdAt not set)
           final hasOnePlayer = players.length == 1;
           final isNotOurs = host != playerId;
           
+          print('DEBUG: Room ${entry.key}: gameState=$gameState, createdAt=$createdAtRaw, host=$host, players=${players.length}, isWaiting=$isWaiting, isRecent=$isRecent, hasOnePlayer=$hasOnePlayer, isNotOurs=$isNotOurs');
+          
           if (isWaiting && isRecent && hasOnePlayer && isNotOurs) {
             foundRoomCode = entry.key as String;
+            print('DEBUG: Found suitable room: $foundRoomCode');
             break;
           }
         }
       } else {
+        print('DEBUG: No quick match rooms found in query');
       }
 
       if (foundRoomCode != null) {
         // Found an open room - join it
+        print('DEBUG: Joining existing quick match room: $foundRoomCode');
         await _joinQuickMatchRoom(foundRoomCode);
       } else {
         // No room found - create one and wait
+        print('DEBUG: No suitable room found, creating new quick match room');
         await _createQuickMatchRoom();
       }
     } catch (e) {
@@ -378,6 +751,18 @@ void _checkAndUpdateHighScore() {
       });
 
       _listenToRoom();
+
+      // Publish local player's selected cardback to Firebase so opponent can see it
+      try {
+        final ref = FirebaseDatabase.instance.ref('rooms/$roomCode/playerSettings/$playerId');
+        await ref.update({
+          'cardbackAsset': CardWidget.defaultCardBackAsset,
+          'choice': cardbackChoice,
+        });
+        print('DEBUG: Published cardback to Firebase on quick match room creation -> $playerId: ${CardWidget.defaultCardBackAsset}');
+      } catch (e) {
+        print('DEBUG: Failed to publish cardback on quick match room creation: $e');
+      }
     } catch (e) {
       // Show error in the Versus Mode modal so user can try again
       _resetToAIMode(showError: true, errorMessage: 'Error creating game. Please try again.');
@@ -435,6 +820,18 @@ void _checkAndUpdateHighScore() {
       });
 
       _listenToRoom();
+
+      // Publish local player's selected cardback to Firebase so opponent can see it
+      try {
+        final ref = FirebaseDatabase.instance.ref('rooms/$roomCode/playerSettings/$playerId');
+        await ref.update({
+          'cardbackAsset': CardWidget.defaultCardBackAsset,
+          'choice': cardbackChoice,
+        });
+        print('DEBUG: Published cardback to Firebase on quick match room join -> $playerId: ${CardWidget.defaultCardBackAsset}');
+      } catch (e) {
+        print('DEBUG: Failed to publish cardback on quick match room join: $e');
+      }
     } catch (e) {
       // Try searching again
       await _searchForGame();
@@ -442,14 +839,18 @@ void _checkAndUpdateHighScore() {
   }
 
   void _cancelQuickMatch() {
+    // Set flag to prevent listener from firing disconnect events
+    _isIntentionallyLeaving = true;
+    
     quickMatchSubscription?.cancel();
     quickMatchSubscription = null;
     gameSubscription?.cancel();
     gameSubscription = null;
     
     // If we created a room, delete it
-    if (isHost && roomCode != null) {
-      FirebaseDatabase.instance.ref('rooms/$roomCode').remove();
+    final roomToDelete = roomCode;
+    if (isHost && roomToDelete != null) {
+      FirebaseDatabase.instance.ref('rooms/$roomToDelete').remove();
     }
     
     setState(() {
@@ -457,6 +858,9 @@ void _checkAndUpdateHighScore() {
       waitingForOpponent = false;
       connectionStatus = '';
       roomCode = null;
+      opponentId = null;
+      _hasEverConnected = false;
+      _isIntentionallyLeaving = false; // Reset for next time
       // Go back to Versus Mode modal
       showRoomSelection = true;
       gameMode = 'ai';
@@ -505,6 +909,18 @@ void _checkAndUpdateHighScore() {
       });
 
       _listenToRoom();
+
+      // Publish local player's selected cardback to Firebase so opponent can see it
+      try {
+        final ref = FirebaseDatabase.instance.ref('rooms/$roomCode/playerSettings/$playerId');
+        await ref.update({
+          'cardbackAsset': CardWidget.defaultCardBackAsset,
+          'choice': cardbackChoice,
+        });
+        print('DEBUG: Published cardback to Firebase on room creation -> $playerId: ${CardWidget.defaultCardBackAsset}');
+      } catch (e) {
+        print('DEBUG: Failed to publish cardback on room creation: $e');
+      }
     } catch (e) {
       setState(() {
         connectionStatus = 'Error creating room: $e';
@@ -569,6 +985,18 @@ void _checkAndUpdateHighScore() {
       });
 
       _listenToRoom();
+
+      // Publish local player's selected cardback to Firebase so opponent can see it
+      try {
+        final ref = FirebaseDatabase.instance.ref('rooms/$roomCode/playerSettings/$playerId');
+        await ref.update({
+          'cardbackAsset': CardWidget.defaultCardBackAsset,
+          'choice': cardbackChoice,
+        });
+        print('DEBUG: Published cardback to Firebase on room join -> $playerId: ${CardWidget.defaultCardBackAsset}');
+      } catch (e) {
+        print('DEBUG: Failed to publish cardback on room join: $e');
+      }
     } catch (e) {
       setState(() {
         connectionStatus = 'Error joining room: $e';
@@ -601,6 +1029,26 @@ void _checkAndUpdateHighScore() {
       }
     });
   }
+  
+  // Helper to reset back to search/selection when room disappears before connection
+  void _resetToSearchState() {
+    gameSubscription?.cancel();
+    gameSubscription = null;
+    quickMatchSubscription?.cancel();
+    quickMatchSubscription = null;
+    
+    setState(() {
+      isSearchingForGame = false;
+      waitingForOpponent = false;
+      roomCode = null;
+      opponentId = null;
+      _hasEverConnected = false;
+      // Go back to Versus Mode modal so they can try again
+      showRoomSelection = true;
+      showInitialOverlay = false;
+      connectionStatus = 'Room closed. Please try again.';
+    });
+  }
 
   void _listenToRoom() {
     if (roomCode == null) return;
@@ -610,19 +1058,28 @@ void _checkAndUpdateHighScore() {
 
     gameSubscription = roomRef.onValue.listen((DatabaseEvent event) {
       if (!mounted) return;
+      
+      // If we're intentionally leaving, ignore all events
+      if (_isIntentionallyLeaving) return;
 
       try {
         final data = event.snapshot.value as Map<dynamic, dynamic>?;
         if (data == null) {
-          _handleOpponentDisconnect();
+          // Room was deleted - only handle as disconnect if we were actually connected
+          if (_hasEverConnected) {
+            _handleOpponentDisconnect();
+          } else {
+            // Room deleted before we ever connected - just reset to search/selection
+            _resetToSearchState();
+          }
           return;
         }
 
         final gameState = data['gameState'] as String?;
         final players = data['players'] as Map<dynamic, dynamic>? ?? {};
 
-        // Check for opponent disconnect
-        if (players.length < 2 && !waitingForOpponent) {
+        // Check for opponent disconnect - only if we were actually connected
+        if (players.length < 2 && _hasEverConnected && !waitingForOpponent) {
           _handleOpponentDisconnect();
           return;
         }
@@ -643,13 +1100,20 @@ void _checkAndUpdateHighScore() {
         }
 
         if (gameState == 'playing' && players.length == 2) {
-          if (waitingForOpponent) {
+          // Mark that we've successfully connected
+          _hasEverConnected = true;
+          
+          // CRITICAL FIX: Always ensure showInitialOverlay is false during active multiplayer games
+          final wasWaitingForOpponent = waitingForOpponent;
+          if (waitingForOpponent || showInitialOverlay) {
             setState(() {
               waitingForOpponent = false;
               isSearchingForGame = false;
               showInitialOverlay = false;
               showCreateRoom = false;
-              _gameSessionId++; // Trigger prize card entrance animation for multiplayer
+              if (wasWaitingForOpponent) {
+                _gameSessionId++; // Trigger prize card entrance animation for multiplayer (only on first connect)
+              }
             });
           }
           _updateGameFromFirebase(data);
@@ -863,14 +1327,47 @@ void _checkAndUpdateHighScore() {
       // Handle rematch transitions and early returns
       if (gameState == 'playing' && players.length == 2) {
         // Check if this is a rematch transition
-        if (_waitingForRematch && gameOver) {
+        // Use multiple conditions to detect rematch:
+        // 1. Standard: waiting flag AND (game was over OR field is empty)
+        // 2. Fallback: game is still in gameOver state but Firebase says 'playing' with empty field
+        //    This handles the case where non-host receives 'playing' before processing rematch request
+        final rematchRequests = data['rematchRequests'] as Map<dynamic, dynamic>? ?? {};
+        final isStandardTransition = _waitingForRematch && 
+            (gameOver || (fieldData.isEmpty && rematchRequests.isEmpty));
+        final isFallbackTransition = !isHost && gameOver && fieldData.isEmpty && rematchRequests.isEmpty;
+        final isRematchTransition = isStandardTransition || isFallbackTransition;
+        
+        print('DEBUG REMATCH: gameState=$gameState, _waitingForRematch=$_waitingForRematch, gameOver=$gameOver, fieldData.isEmpty=${fieldData.isEmpty}, rematchRequests=$rematchRequests, isStandardTransition=$isStandardTransition, isFallbackTransition=$isFallbackTransition, isRematchTransition=$isRematchTransition, isHost=$isHost');
+        
+        if (isRematchTransition) {
           final firstPlayer = data['firstPlayer'] as String?;
+          print('DEBUG REMATCH: Transition detected! firstPlayer=$firstPlayer');
           if (firstPlayer != null) {
-            _handleRematchStart(firstPlayer);
+            // Only non-host should use _handleRematchStart
+            // Host handles transition in _initializeCompleteGameState().then()
+            if (!isHost) {
+              print('DEBUG REMATCH: Non-host calling _handleRematchStart');
+              _handleRematchStart(firstPlayer);
+              print('DEBUG REMATCH: Non-host _handleRematchStart complete, continuing to process Firebase data');
+            } else {
+              // Host: just clear waiting flag, let .then() handle the rest
+              print('DEBUG REMATCH: Host clearing waiting flag');
+              _waitingForRematch = false;
+            }
           }
         }
+        
+        // SAFEGUARD: If still in waiting state but game is playing, clear it
+        // This prevents getting stuck in waiting forever
+        if (_waitingForRematch && !gameOver) {
+          print('DEBUG REMATCH: Safeguard triggered - clearing stuck waiting state');
+          setState(() {
+            _waitingForRematch = false;
+          });
+        }
 
-        if (waitingForOpponent) {
+        // CRITICAL FIX: Always ensure showInitialOverlay is false during active multiplayer games
+        if (waitingForOpponent || showInitialOverlay) {
           setState(() {
             waitingForOpponent = false;
             isSearchingForGame = false;
@@ -930,6 +1427,38 @@ void _checkAndUpdateHighScore() {
 
         // CRITICAL FIX: Only trust Firebase for turn state
         isPlayerTurn = newTurnState;
+
+        // Read player-specific settings (like selected cardback) from Firebase
+        final playerSettings = data['playerSettings'] as Map<dynamic, dynamic>? ?? {};
+        print('DEBUG: playerSettings payload from Firebase: $playerSettings');
+        if (playerSettings.isNotEmpty) {
+          for (var entry in playerSettings.entries) {
+            final pid = entry.key as String;
+            final settingsMap = entry.value as Map<dynamic, dynamic>? ?? {};
+            String? asset;
+            if (settingsMap.containsKey('cardbackAsset')) {
+              asset = settingsMap['cardbackAsset'] as String?;
+            } else if (settingsMap.containsKey('choice')) {
+              final choice = settingsMap['choice'] as String?;
+              if (choice == 'Opal') {
+                asset = 'assets/images/cardback5.png';
+              } else if (choice == 'Amethyst') {
+                asset = 'assets/images/cardback4.png';
+              } else if (choice == 'Amber') {
+                asset = 'assets/images/cardback3.png';
+              } else if (choice == 'Onyx') {
+                asset = 'assets/images/cardback2.png';
+              } else {
+                asset = 'assets/images/cardback.png';
+              }
+            }
+
+            if (asset != null) {
+              playerCardbackAssets[pid] = asset;
+            }
+          }
+          print('DEBUG: populated playerCardbackAssets: $playerCardbackAssets');
+        }
 
         // Track previous field length to detect opponent card plays
         final previousFieldLength = field.length;
@@ -1100,8 +1629,10 @@ void _checkAndUpdateHighScore() {
           final myModifiers =
               playerModifiersData[playerId] as Map<dynamic, dynamic>? ?? {};
           for (String key in playerModifiers.keys) {
-            if (myModifiers.containsKey(key)) {
-              playerModifiers[key] = myModifiers[key] as bool? ?? false;
+            // FIX: Use sanitized key to look up in Firebase data
+            String sanitizedKey = _sanitizeModifierForFirebase(key);
+            if (myModifiers.containsKey(sanitizedKey)) {
+              playerModifiers[key] = myModifiers[sanitizedKey] as bool? ?? false;
             }
           }
         }
@@ -1110,8 +1641,10 @@ void _checkAndUpdateHighScore() {
           final oppModifiers =
               playerModifiersData[opponentId] as Map<dynamic, dynamic>? ?? {};
           for (String key in opponentModifiers.keys) {
-            if (oppModifiers.containsKey(key)) {
-              opponentModifiers[key] = oppModifiers[key] as bool? ?? false;
+            // FIX: Use sanitized key to look up in Firebase data
+            String sanitizedKey = _sanitizeModifierForFirebase(key);
+            if (oppModifiers.containsKey(sanitizedKey)) {
+              opponentModifiers[key] = oppModifiers[sanitizedKey] as bool? ?? false;
             }
           }
         }
@@ -1120,7 +1653,7 @@ void _checkAndUpdateHighScore() {
         final lastTimeoutPenalty =
             data['lastTimeoutPenalty'] as Map<dynamic, dynamic>?;
         final isOpponentTimeoutPenalty = lastTimeoutPenalty != null &&
-            lastTimeoutPenalty['penalizedPlayer'] == opponentId;
+            lastTimeoutPenalty['timeoutPlayer'] == opponentId;
 
         // Update OPPONENT display based on sizes
         if (opponentId != null) {
@@ -1143,46 +1676,62 @@ void _checkAndUpdateHighScore() {
           if (opponentHand.length != opponentHandSize) {
             opponentHand = List.generate(opponentHandSize, (_) => 'cardback');
           }
-          if (opponentPrizeCards.length != opponentPrizeCount) {
-// NEW: Handle player benefiting from opponent timeout
-    if (isOpponentTimeoutPenalty) {
-      // Player gets prize card due to opponent timeout - show WIN effects!
-      Future.delayed(const Duration(milliseconds: 100), () {
-        playPrizeCardSound(); // Use player's win sound
-      });
-      
-      // Trigger player win shine animation
-      _showPrizeWinShine = true;
-      Future.delayed(const Duration(milliseconds: 800), () {
-        if (mounted) {
-          setState(() {
-            _showPrizeWinShine = false;
-          });
-        }
-      });
-    }
-    // Handle normal opponent wins
-    else if (opponentWonPrize) {
-      // Only play sound if opponent still has prize cards left (not the final one)
-      if (opponentPrizeCount > 0) {
-        Future.delayed(const Duration(milliseconds: 100), () {
-          playOpponentPrizeCardSound();
-        });
-      }
-      // Trigger opponent win shine animation for multiplayer
-      _showOpponentWinShine = true;
-      Future.delayed(const Duration(milliseconds: 800), () {
-        if (mounted) {
-          setState(() {
-            _showOpponentWinShine = false;
-          });
-        }
-      });
-    }
 
-    opponentPrizeCards =
-        List.generate(opponentPrizeCount, (_) => 'cardback');
-  }
+          // CRITICAL: Handle player benefiting from opponent timeout BEFORE updating prize counts
+          // This ensures animation/sound triggers even if prize count hasn't updated yet
+          if (isOpponentTimeoutPenalty) {
+            final String penaltyId = (lastTimeoutPenalty != null && lastTimeoutPenalty['id'] != null)
+                ? lastTimeoutPenalty['id'].toString()
+                : lastTimeoutPenalty.toString();
+
+            if (!processedTimeoutPenalties.contains(penaltyId)) {
+              processedTimeoutPenalties.add(penaltyId);
+              print('DEBUG: Opponent timeout detected! Triggering win animation and sound.');
+
+              // Trigger player win shine animation and play win sound
+              setState(() {
+                _showPrizeWinShine = true;
+              });
+
+              Future.delayed(const Duration(milliseconds: 100), () {
+                if (mounted) {
+                  playPrizeCardSound(); // Use player's win sound
+                }
+              });
+
+              Future.delayed(const Duration(milliseconds: 800), () {
+                if (mounted) {
+                  setState(() {
+                    _showPrizeWinShine = false;
+                  });
+                }
+              });
+            }
+          }
+
+          if (opponentPrizeCards.length != opponentPrizeCount) {
+            // Handle normal opponent wins (non-timeout)
+            if (opponentWonPrize) {
+              // Only play sound if opponent still has prize cards left (not the final one)
+              if (opponentPrizeCount > 0) {
+                Future.delayed(const Duration(milliseconds: 100), () {
+                  playOpponentPrizeCardSound();
+                });
+              }
+              // Trigger opponent win shine animation for multiplayer
+              _showOpponentWinShine = true;
+              Future.delayed(const Duration(milliseconds: 800), () {
+                if (mounted) {
+                  setState(() {
+                    _showOpponentWinShine = false;
+                  });
+                }
+              });
+            }
+
+            opponentPrizeCards =
+                List.generate(opponentPrizeCount, (_) => 'cardback');
+          }
   if (opponentDrawPile.length != opponentDrawSize) {
     opponentDrawPile =
         List.generate(opponentDrawSize, (_) => 'cardback');
@@ -1269,17 +1818,17 @@ void _checkAndUpdateHighScore() {
 
   // FIX: Sync win streaks IMMEDIATELY when game ends, before checking rematch status
   final winStreaksData = data['winStreaks'] as Map<dynamic, dynamic>? ?? {};
-  if (winStreaksData.isNotEmpty) {
+      if (winStreaksData.isNotEmpty) {
     setState(() {
       for (var entry in winStreaksData.entries) {
         multiplayerWinStreaks[entry.key as String] = entry.value as int? ?? 0;
       }
-      
-      // FIX: Update the local winStreak variable that the UI displays
+      // Update the local winStreak variable that the UI displays
+      // but DO NOT treat multiplayer streaks as global progress for
+      // high-score or unlocking cardbacks. High score is only updated
+      // from single-player (non-human) wins.
       if (playerId != null && multiplayerWinStreaks.containsKey(playerId)) {
         winStreak = multiplayerWinStreaks[playerId]!;
-        // Check and update high score
-        _checkAndUpdateHighScore();
       }
     });
   }
@@ -1288,47 +1837,99 @@ void _checkAndUpdateHighScore() {
   final rematchRequests =
       data['rematchRequests'] as Map<dynamic, dynamic>? ?? {};
 
+  print('DEBUG GAMEOVER: Processing rematch. rematchRequests=$rematchRequests, playerId=$playerId, gameOver=$gameOver, isHost=$isHost');
+
   // If this player hasn't requested rematch yet, don't process other player's request
   if (!rematchRequests.containsKey(playerId)) {
+    print('DEBUG GAMEOVER: Early return - this player hasnt requested rematch yet');
     return;
   }
 
   // Only proceed if both players have requested rematch
   if (rematchRequests.length == 2 && gameOver) {
+    print('DEBUG GAMEOVER: Both players requested rematch!');
+    
+    // CRITICAL: Check if we're already initializing a rematch to prevent double-processing
+    if (_isInitializingRematch) {
+      print('DEBUG GAMEOVER: Already initializing rematch, skipping');
+      return;
+    }
+    
     // Get who went first last game and alternate
     final lastFirstPlayer = data['firstPlayer'] as String?;
     final nextFirstPlayer =
         (lastFirstPlayer == playerId) ? opponentId : playerId;
+    print('DEBUG GAMEOVER: lastFirstPlayer=$lastFirstPlayer, nextFirstPlayer=$nextFirstPlayer');
 
     if (isHost) {
+      print('DEBUG GAMEOVER: Host starting rematch initialization');
+      // Set flag to prevent double-processing
+      _isInitializingRematch = true;
+      
+      // CRITICAL: Clear waiting flag IMMEDIATELY to prevent race condition
+      // The Firebase listener might trigger before .then() runs, causing double-processing
+      _waitingForRematch = false;
+      
       // Host initializes the new game
       _resetGameState();
+      // Clear hands so they get re-populated from Firebase
+      playerHand = [];
+      playerPrizeCards = [];
+      playerDrawPile = [];
+      opponentHand = [];
+      opponentPrizeCards = [];
+      opponentDrawPile = [];
+      opponentActualHand = [];
+      opponentActualDrawPile = [];
+      // Increment game session ID to trigger animations
+      _gameSessionId++;
+      
+      print('DEBUG GAMEOVER: Host calling _initializeCompleteGameState');
       _initializeCompleteGameState(nextFirstPlayer).then((_) {
+        print('DEBUG GAMEOVER: _initializeCompleteGameState completed, mounted=$mounted');
+        // Clear the initialization flag
+        _isInitializingRematch = false;
+        
         if (mounted) {
           setState(() {
+            // Always ensure these are in correct state for new game
             gameOver = false;
             waitingForOpponent = false;
             _waitingForRematch = false;
-            message = (nextFirstPlayer == playerId)
-                ? "Your turn!"
-                : "Opponent's turn!";
+            showInitialOverlay = false; // Ensure overlay is hidden for rematch
+            
+            // Only set turn message if not already set
+            if (message.isEmpty || message.contains('Waiting') || message.contains('Starting')) {
+              message = (nextFirstPlayer == playerId)
+                  ? "Your turn!"
+                  : "Opponent's turn!";
+            }
             isPlayerTurn = (nextFirstPlayer == playerId);
           });
-          if (nextFirstPlayer == playerId) {
+          print('DEBUG GAMEOVER: Host setState complete, isPlayerTurn=$isPlayerTurn');
+          
+          // Start timer if it's our turn and timer isn't already running
+          if (nextFirstPlayer == playerId && (turnTimer == null || !turnTimer!.isActive)) {
+            print('DEBUG GAMEOVER: Host starting timer');
             startTimer();
           }
         }
       }).catchError((error) {
+        print('DEBUG GAMEOVER: _initializeCompleteGameState error: $error');
+        // Clear the initialization flag on error too
+        _isInitializingRematch = false;
         // Reset waiting state on error
         if (mounted) {
           setState(() {
             _waitingForRematch = false;
+            gameOver = true; // Restore game over state on error
             message = "Failed to start new game";
           });
         }
       });
     } else {
       // Non-host waits for host to initialize, but doesn't change gameOver yet
+      print('DEBUG GAMEOVER: Non-host setting _waitingForRematch = true');
       setState(() {
         _waitingForRematch = true;
         message = "Starting new game...";
@@ -1338,23 +1939,61 @@ void _checkAndUpdateHighScore() {
       // when the host updates the game state to 'playing'
     }
   }
+  print('DEBUG GAMEOVER: Exiting _handleGameOverFromFirebase');
 }
 
 // Also add this helper method to handle the transition from waiting to playing
   void _handleRematchStart(String nextFirstPlayer) {
-    if (mounted && _waitingForRematch) {
-      setState(() {
-        gameOver = false;
-        waitingForOpponent = false;
-        _waitingForRematch = false;
-        message =
-            (nextFirstPlayer == playerId) ? "Your turn!" : "Opponent's turn!";
-        isPlayerTurn = (nextFirstPlayer == playerId);
-      });
+    print('DEBUG _handleRematchStart: Called with nextFirstPlayer=$nextFirstPlayer, mounted=$mounted, _waitingForRematch=$_waitingForRematch, gameOver=$gameOver, field.isEmpty=${field.isEmpty}');
+    if (!mounted) {
+      print('DEBUG _handleRematchStart: Early return - not mounted');
+      return;
+    }
+    
+    // Only proceed if we were waiting for rematch OR if we're stuck in gameOver with stale data
+    final shouldTransition = _waitingForRematch || (gameOver && field.isEmpty);
+    if (!shouldTransition) {
+      print('DEBUG _handleRematchStart: Early return - shouldTransition=$shouldTransition');
+      return;
+    }
+    print('DEBUG _handleRematchStart: Proceeding with transition');
+    
+    // CRITICAL FIX: Reset local game state for non-host before processing new game
+    // This clears old field, cards, modifiers, etc.
+    field = [];
+    activityLog.clear();
+    fieldAceValue = null;
+    fieldAceValueHistory.clear();
+    clearSelections();
+    playerMaxHandSize = 2;
+    activePlayerModifier = null;
+    showModifierSelection = false;
+    
+    // Clear hands so they get re-populated from Firebase
+    playerHand = [];
+    playerPrizeCards = [];
+    playerDrawPile = [];
+    opponentHand = [];
+    opponentPrizeCards = [];
+    opponentDrawPile = [];
+    opponentActualHand = [];
+    opponentActualDrawPile = [];
+    
+    // Increment game session ID to trigger animations
+    _gameSessionId++;
+    
+    setState(() {
+      gameOver = false;
+      waitingForOpponent = false;
+      _waitingForRematch = false;
+      showInitialOverlay = false; // Ensure overlay is hidden for rematch
+      message =
+          (nextFirstPlayer == playerId) ? "Your turn!" : "Opponent's turn!";
+      isPlayerTurn = (nextFirstPlayer == playerId);
+    });
 
-      if (nextFirstPlayer == playerId) {
-        startTimer();
-      }
+    if (nextFirstPlayer == playerId) {
+      startTimer();
     }
   }
 
@@ -1545,25 +2184,32 @@ void _checkAndUpdateHighScore() {
   }
 
   Future<void> _startRematch() async {
+    print('DEBUG _startRematch: Called. roomCode=$roomCode, playerId=$playerId, opponentId=$opponentId, isHost=$isHost');
     setState(() {
       currentBackgroundIndex =
           (currentBackgroundIndex + 1) % backgrounds.length;
     });
 
-    if (roomCode == null || playerId == null || opponentId == null) return;
+    if (roomCode == null || playerId == null || opponentId == null) {
+      print('DEBUG _startRematch: Early return - missing roomCode/playerId/opponentId');
+      return;
+    }
 
     try {
       final DatabaseReference roomRef =
           FirebaseDatabase.instance.ref('rooms/$roomCode');
 
       // Mark this player as ready for rematch
+      print('DEBUG _startRematch: Writing rematchRequest to Firebase for $playerId');
       await roomRef.child('rematchRequests').child(playerId!).set(true);
+      print('DEBUG _startRematch: Firebase write complete');
 
       // Update UI to show waiting state
       setState(() {
         _waitingForRematch = true;
         message = "Waiting for opponent to start next game...";
       });
+      print('DEBUG _startRematch: Set _waitingForRematch = true');
 
       // Note: The actual game state transition will be handled by _handleGameOverFromFirebase
       // when it detects both players have requested a rematch
@@ -1575,25 +2221,49 @@ void _checkAndUpdateHighScore() {
     }
   }
 
-  void _handleOpponentDisconnect() {
+  Future<void> _handleOpponentDisconnect() async {
     if (gameMode != 'human') return;
+    
+    // Don't show disconnect if we're intentionally leaving or never connected
+    final shouldShowMessage = _hasEverConnected && !_isIntentionallyLeaving;
 
+    // Cancel any active listeners/timers
+    gameSubscription?.cancel();
+    gameSubscription = null;
+    quickMatchSubscription?.cancel();
+    quickMatchSubscription = null;
+    turnTimer?.cancel();
 
-    setState(() {
-      message = "Opponent disconnected";
-      isPlayerTurn = false;
-      turnTimer?.cancel();
-    });
-
-    // Optional: Auto-switch to AI mode or return to menu
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted && gameMode == 'human') {
-        setState(() {
-          showRoomSelection = true;
-          connectionStatus = 'Opponent disconnected';
-        });
+    // Attempt to remove the room from Firebase if it exists
+    final String? rc = roomCode;
+    if (rc != null) {
+      try {
+        await FirebaseDatabase.instance.ref('rooms/$rc').remove();
+      } catch (e) {
+        // ignore removal errors
       }
-    });
+    }
+
+    // Reset connection tracking flags
+    _hasEverConnected = false;
+    _isIntentionallyLeaving = false;
+
+    // Reset to initial overlay and multiplayer defaults
+    _resetMultiplayerState();
+
+    // Show a floating snackbar only if we were actually connected
+    if (shouldShowMessage && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('opponent left!', style: const TextStyle(fontFamily: 'Balatro')),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: Colors.black87,
+          margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+          elevation: 6,
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
   }
 
   void _setupMultiplayerGame() {
@@ -1624,8 +2294,8 @@ void _checkAndUpdateHighScore() {
       connectionStatus = '';
     });
 
-    // Resume AI game if we were in AI mode
-    if (gameMode == 'ai' && !gameOver) {
+    // Resume AI game if we were in AI mode and the initial overlay is not shown
+    if (gameMode == 'ai' && !gameOver && !showInitialOverlay) {
       setState(() {
         message = isPlayerTurn ? "Your turn!" : "Opponent's turn!";
       });
@@ -1638,10 +2308,14 @@ void _checkAndUpdateHighScore() {
 
 // Update your _leaveRoom method to handle cleanup better
   void _leaveRoom() {
+    // Set flag to prevent false disconnect messages
+    _isIntentionallyLeaving = true;
+    
     try {
       // Cancel timers and listeners
       turnTimer?.cancel();
       gameSubscription?.cancel();
+      gameSubscription = null;
 
       // Remove from Firebase room
       if (roomCode != null && playerId != null) {
@@ -1654,6 +2328,69 @@ void _checkAndUpdateHighScore() {
       _resetMultiplayerState();
       _resetToAIMode();
     }
+  }
+
+  // Centralized global exit handler used by persistent exit icon
+  void _handleGlobalExit() {
+    // Set flag to prevent false disconnect messages
+    _isIntentionallyLeaving = true;
+    
+    try {
+      turnTimer?.cancel();
+      gameSubscription?.cancel();
+      gameSubscription = null;
+      quickMatchSubscription?.cancel();
+      quickMatchSubscription = null;
+    } catch (e) {}
+
+    // Stop any audio playback
+    try {
+      _audioPlayer.stop();
+      _tapAudioPlayer.stop();
+      _gameOverAudioPlayer.stop();
+      _oppWinAudioPlayer.stop();
+    } catch (e) {}
+
+    // Close ace dialog if open
+    if (_aceDialogOpen && mounted) {
+      try {
+        Navigator.of(context).pop();
+      } catch (e) {}
+      _aceDialogOpen = false;
+    }
+
+    // Update UI/state to reflect a full reset (like fresh app start)
+    setState(() {
+      // Prevent AI from continuing
+      gameOver = true;
+      isPlayerTurn = false;
+
+      // Show initial overlay and clear transient UI state
+      showInitialOverlay = true;
+      showRoomSelection = false;
+      showCreateRoom = false;
+      showJoinRoom = false;
+      isSearchingForGame = false;
+      waitingForOpponent = false;
+      message = '';
+      clearSelections();
+      activePlayerModifier = null;
+      showModifierSelection = false;
+
+      // Reset dynamic single-player state
+      winStreak = 0;
+      timerSeconds = 0;
+      _isOpponentTurnRunning = false;
+      // Reset playmat rotation to initial
+      currentBackgroundIndex = 0;
+      _gameSessionId = 0;
+    });
+
+    // Ensure multiplayer cleanup and a fresh multiplayer-ready state
+    _leaveRoom();
+    _prepareForMultiplayer();
+    // Reinitialize underlying game state so the initial overlay shows a fresh game
+    _setupGame(rotateBackground: false);
   }
 
   // Update your _showGameModeSelection method
@@ -1760,6 +2497,11 @@ void _checkAndUpdateHighScore() {
   void _resetMultiplayerState() {
     quickMatchSubscription?.cancel();
     quickMatchSubscription = null;
+    gameSubscription?.cancel();
+    gameSubscription = null;
+    
+    // Reset rematch initialization flag
+    _isInitializingRematch = false;
     
     setState(() {
       roomCode = null;
@@ -1772,7 +2514,10 @@ void _checkAndUpdateHighScore() {
       gameMode = 'ai';
       showRoomSelection = false;
       showInitialOverlay = true;
-// Reset hand data
+      _hasEverConnected = false;
+      _isIntentionallyLeaving = false;
+      _waitingForRematch = false;
+      // Reset hand data
       opponentActualHand = [];
       opponentActualDrawPile = [];
       lastKnownOpponentHandSize = null;
@@ -1869,11 +2614,30 @@ void _checkAndUpdateHighScore() {
     opponentDrawPile = [];
     opponentPrizeCards = [];
     processedTimeoutPenalties = <String>{};
-    _configureAudioSession(); // Allow mixing with other audio (e.g., Spotify)
-    _preloadTapSound();
-    _configureLowLatencyAudio();
-    _loadHighScore(); 
-    _setupGame();
+    // Initialize audio context and players so they inherit the configured audio context
+    _initAudioPlayers(); // Allow mixing with other audio (e.g., Spotify)
+    _loadHighScore();
+    _loadTotalWins();
+    // Ensure unlocked flags are loaded before loading choice, then ensure unlocked
+    // After loading the saved cardback choice, set the AI opponent cardback
+    // to match the player's selected cardback so the initial overlay shows
+    // the same visual immediately.
+    _loadUnlockedCardbacks().then((_) {
+      _loadCardbackChoice().then((_) {
+        _ensureCardbackUnlocked();
+        setState(() {
+          aiOpponentCardbackAsset = CardWidget.defaultCardBackAsset;
+        });
+      });
+    });
+    _loadVolumeSetting();
+    // Load saved default difficulty and apply it to the selector immediately
+    _loadDefaultDifficulty().then((_) {
+      setState(() {
+        aiDifficulty = defaultAiDifficulty;
+      });
+    });
+    _setupGame(rotateBackground: false);
   }
 
   Future<void> _preloadTapSound() async {
@@ -2434,13 +3198,15 @@ void _handleSwipeUpModifier(String modifierType) async {
     }
   }
 
-  void _setupGame() {
+  void _setupGame({bool rotateBackground = true}) {
     // Rotate to next background and increment game session for animations
-    setState(() {
-      currentBackgroundIndex =
-          (currentBackgroundIndex + 1) % backgrounds.length;
-      _gameSessionId++; // Trigger prize card entrance animation
-    });
+    if (rotateBackground) {
+      setState(() {
+        currentBackgroundIndex =
+            (currentBackgroundIndex + 1) % backgrounds.length;
+        _gameSessionId++; // Trigger prize card entrance animation
+      });
+    }
     try {
       fullDeck = _createFullDeck();
       fullDeck.shuffle(Random());
@@ -2459,6 +3225,34 @@ void _handleSwipeUpModifier(String modifierType) async {
       opponentDrawPile = opponentDeck.sublist(5);
       opponentActualDrawPile =
           gameMode == 'ai' ? List.from(opponentDrawPile) : [];
+
+      // Configure AI opponent cardback for Sharp difficulty.
+      // Default the AI's cardback to the player's chosen cardback until
+      // the player has achieved 2 consecutive wins. After 2 consecutive
+      // wins, the next (third) match will show the overridden cardback
+      // based on projected streak thresholds.
+      if (gameMode == 'ai' && aiDifficulty == 3) {
+        if (winStreak < 2) {
+          // Keep AI visually matching the player for early/familiar matches
+          aiOpponentCardbackAsset = CardWidget.defaultCardBackAsset;
+        } else {
+          // Player has 2+ consecutive wins — show milestone-based cardback
+          final projectedStreak = winStreak + 1; // this game would be the next win
+          if (projectedStreak >= 10) {
+            aiOpponentCardbackAsset = 'assets/images/cardback5.png'; // Opal
+          } else if (projectedStreak >= 7) {
+            aiOpponentCardbackAsset = 'assets/images/cardback4.png'; // Amethyst
+          } else if (projectedStreak >= 5) {
+            aiOpponentCardbackAsset = 'assets/images/cardback3.png'; // Amber
+          } else if (projectedStreak >= 3) {
+            aiOpponentCardbackAsset = 'assets/images/cardback2.png'; // Onyx
+          } else {
+            aiOpponentCardbackAsset = CardWidget.defaultCardBackAsset;
+          }
+        }
+      } else {
+        aiOpponentCardbackAsset = CardWidget.defaultCardBackAsset;
+      }
 
       // Initialize card counting for new game
       playedCardCounts.clear();
@@ -2791,10 +3585,17 @@ void _handleSwipeUpModifier(String modifierType) async {
       isPlayerTurn = false;
       gameOver = true;
       winner = 'player';
-      // Update win streak for both multiplayer and AI difficulty 3
-      if (gameMode == 'human' || aiDifficulty == 3) {
+      // Update win streak only for single-player (AI) mode.
+      // Multiplayer win streaks are tracked via Firebase and should NOT
+      // affect the global high score or unlocks.
+      if (gameMode != 'human') {
         winStreak += 1;
         _checkAndUpdateHighScore();
+        // Increment total wins for sharp difficulty (difficulty 3)
+        if (aiDifficulty == 3) {
+          totalWins += 1;
+          _saveTotalWins(totalWins);
+        }
       }
       clearSelections();
     });
@@ -2919,6 +3720,9 @@ Future<void> playOpponentPrizeCardSound() async {
   }
 
   void startTimer() {
+    // Don't start timer if we're on the initial overlay (user exited to menu)
+    if (showInitialOverlay) return;
+    
     turnTimer?.cancel();
 
     int baseTime;
@@ -2958,6 +3762,9 @@ Future<void> playOpponentPrizeCardSound() async {
   }
 
   void handlePlayerTimeout() {
+    // Don't handle timeout if we're on the initial overlay (user exited to menu)
+    if (showInitialOverlay || gameOver) return;
+    
     setState(() {
       message = "Time's up!";
       clearSelections();
@@ -2986,6 +3793,12 @@ Future<void> playOpponentPrizeCardSound() async {
     }
 
     if (gameMode == 'human') {
+      // Immediately update local activity log for instant feedback
+      setState(() {
+        activityLog.add('You timed out!');
+        activityLogColor = Colors.redAccent;
+      });
+      
       _updateTimeoutPenaltyToFirebase().then((_) {
         if (mounted && !gameOver) {
           setState(() {
@@ -3004,14 +3817,19 @@ Future<void> playOpponentPrizeCardSound() async {
       });
     } else if (!gameOver && gameMode == 'ai') {
       // AI mode - opponent (AI) gets a prize card when human times out
-if (opponentPrizeCards.isNotEmpty) {
-  opponentPrizeCards.removeLast();
-  // Only play sound if opponent still has prize cards left (not the final one)
-  if (opponentPrizeCards.isNotEmpty) {
-    playOpponentPrizeCardSound();
-  }
-  checkForWin();
-}
+      setState(() {
+        activityLog.add('You timed out!');
+        activityLogColor = Colors.redAccent;
+      });
+      
+      if (opponentPrizeCards.isNotEmpty) {
+        opponentPrizeCards.removeLast();
+        // Only play sound if opponent still has prize cards left (not the final one)
+        if (opponentPrizeCards.isNotEmpty) {
+          playOpponentPrizeCardSound();
+        }
+        checkForWin();
+      }
       isPlayerTurn = false;
       Future.delayed(const Duration(seconds: 1), opponentTurn);
     }
@@ -3584,12 +4402,15 @@ if (opponentPrizeCards.isNotEmpty) {
     // FIXED: Only run opponent AI in single-player mode
     if (gameMode != 'ai' || gameOver) return;
 
+    // Don't run if initial overlay is showing (user exited to menu)
+    if (showInitialOverlay) return;
+
     if (gameOver) return;
     turnTimer?.cancel();
     setState(() {});
 
     await Future.delayed(const Duration(seconds: 1));
-    if (!mounted || gameOver) return;
+    if (!mounted || gameOver || showInitialOverlay) return;
 
     // CRITICAL FIX: Add recursion prevention using class variable
     if (_isOpponentTurnRunning) {
@@ -4331,17 +5152,16 @@ void _instantPlayCard(int index) async {
       _handleSwipeUpModifier(playerAvailableModifiers[i]);
     }
   },
-  child: AnimatedModifierCard(
-    modifierType: playerAvailableModifiers[i],
-    tooltip: _getModifierTooltip(playerAvailableModifiers[i]),
-    used: playerModifiers[playerAvailableModifiers[i]] ?? false,
-    onTap: isPlayerTurn
-        ? () => _useModifier(playerAvailableModifiers[i])
-        : null,
-    isMobile: isMobile,
-    isSmallPhone: isSmallPhone,
-    isSelected: activePlayerModifier == playerAvailableModifiers[i],
-  ),
+        child: AnimatedModifierCard(
+          modifierType: playerAvailableModifiers[i],
+          tooltip: _getModifierTooltip(playerAvailableModifiers[i]),
+          used: playerModifiers[playerAvailableModifiers[i]] ?? false,
+          onTap: isPlayerTurn ? () => _useModifier(playerAvailableModifiers[i]) : null,
+          isMobile: isMobile,
+          isSmallPhone: isSmallPhone,
+          isSelected: activePlayerModifier == playerAvailableModifiers[i],
+          cardBackAsset: playerCardbackAssets[playerId] ?? CardWidget.defaultCardBackAsset,
+        ),
 ),
       ],
     ],
@@ -4578,6 +5398,7 @@ void _instantPlayCard(int index) async {
         child: Text(
           text,
           style: TextStyle(
+            fontFamily: 'Balatro',
             color: isUsed ? Colors.grey : Colors.white,
             fontSize: 10,
             fontWeight: FontWeight.bold,
@@ -4801,7 +5622,7 @@ void _instantPlayCard(int index) async {
         TextButton.icon(
           onPressed: _cancelQuickMatch,
           icon: const Icon(Icons.close, size: 18),
-          label: const Text('Cancel'),
+          label: const Text('Cancel', style: TextStyle(fontFamily: 'Balatro')),
           style: TextButton.styleFrom(
             foregroundColor: Colors.white54,
           ),
@@ -5104,7 +5925,7 @@ void _instantPlayCard(int index) async {
                       minimumSize: const Size(double.infinity, 48),
                     ),
                     onPressed: _createRoom,
-                    child: const Text('Create'),
+                    child: const Text('Create', style: TextStyle(fontFamily: 'Balatro')),
                   ),
                   const SizedBox(height: 16),
                   TextButton(
@@ -5155,9 +5976,10 @@ void _instantPlayCard(int index) async {
                   color: Color.fromARGB(255, 255, 64, 129),
                 ),
                 const SizedBox(height: 16),
-                const Text(
+                Text(
                   'Join Room',
-                  style: TextStyle(
+                  style: const TextStyle(
+                    fontFamily: 'Balatro',
                     color: Color.fromARGB(255, 255, 64, 129),
                     fontSize: 24,
                     fontWeight: FontWeight.bold,
@@ -5168,7 +5990,10 @@ void _instantPlayCard(int index) async {
                   controller: roomCodeController,
                   decoration: InputDecoration(
                     hintText: 'Enter room code',
-                    hintStyle: const TextStyle(color: Colors.white54),
+                    hintStyle: const TextStyle(
+                      fontFamily: 'Balatro',
+                      color: Colors.white54,
+                    ),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(8),
                       borderSide: const BorderSide(color: Colors.white54),
@@ -5180,7 +6005,10 @@ void _instantPlayCard(int index) async {
                       ),
                     ),
                   ),
-                  style: const TextStyle(color: Colors.white),
+                  style: const TextStyle(
+                    fontFamily: 'Balatro',
+                    color: Colors.white,
+                  ),
                   textCapitalization: TextCapitalization.characters,
                   maxLength: 3,
                 ),
@@ -5209,7 +6037,10 @@ void _instantPlayCard(int index) async {
                   },
                   child: const Text(
                     'Back',
-                    style: TextStyle(color: Colors.white54),
+                    style: TextStyle(
+                      fontFamily: 'Balatro',
+                      color: Colors.white54,
+                    ),
                   ),
                 ),
               ],
@@ -5293,25 +6124,34 @@ Widget build(BuildContext context) {
         child: Stack(
           children: [
             Positioned.fill(
-  child: AnimatedSwitcher(
-    duration: Duration(milliseconds: 1500),
-    transitionBuilder: (Widget child, Animation<double> animation) {
-      return FadeTransition(
-        opacity: animation,
-        child: RepaintBoundary(child: child),
-      );
-    },
-    child: RepaintBoundary( // And this one
-      child: Transform.scale(
-        scale: 4.5,
-        child: Image.asset(
-          backgrounds[currentBackgroundIndex],
+  child: Stack(
+    fit: StackFit.expand,
+    children: [
+      // Keep a dark background behind the playmat during transitions
+      Container(color: Colors.black),
+      AnimatedSwitcher(
+        duration: const Duration(milliseconds: 900),
+        switchInCurve: Curves.easeInOut,
+        switchOutCurve: Curves.easeInOut,
+        transitionBuilder: (Widget child, Animation<double> animation) {
+          return FadeTransition(
+            opacity: animation,
+            child: RepaintBoundary(child: child),
+          );
+        },
+        child: RepaintBoundary(
           key: ValueKey(backgrounds[currentBackgroundIndex]),
-          fit: BoxFit.cover,
-          alignment: Alignment.center,
+          child: Transform.scale(
+            scale: 4.25,
+            child: Image.asset(
+              backgrounds[currentBackgroundIndex],
+              fit: BoxFit.cover,
+              alignment: Alignment.center,
+            ),
+          ),
         ),
       ),
-    ),
+    ],
   ),
 ),
             // Center game content with max width on desktop
@@ -5377,7 +6217,12 @@ Widget build(BuildContext context) {
                                             ),
                                           ],
                                         ),
-                                        child: const CardWidget(isCardBack: true),
+                                        child: CardWidget(
+                                          isCardBack: true,
+                                          cardBackAsset: gameMode == 'ai'
+                                              ? aiOpponentCardbackAsset
+                                              : (playerCardbackAssets[opponentId] ?? CardWidget.defaultCardBackAsset),
+                                        ),
                                       ),
                                     ),
                                   ),
@@ -5408,7 +6253,12 @@ Widget build(BuildContext context) {
                                         ),
                                       ],
                                     ),
-                                    child: const CardWidget(isCardBack: true),
+                                    child: CardWidget(
+                                      isCardBack: true,
+                                      cardBackAsset: gameMode == 'ai'
+                                          ? aiOpponentCardbackAsset
+                                          : (playerCardbackAssets[opponentId] ?? CardWidget.defaultCardBackAsset),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -5450,27 +6300,19 @@ Widget build(BuildContext context) {
                                           ),
                                           alignment: Alignment.centerLeft,
                                           child: AnimatedSwitcher(
-                                            duration: const Duration(milliseconds: 250),
+                                            duration: const Duration(milliseconds: 150),
                                             transitionBuilder: (Widget child, Animation<double> animation) {
-                                              return SlideTransition(
-                                                position: Tween<Offset>(
-                                                  begin: const Offset(0, 0.4),
-                                                  end: Offset.zero,
-                                                ).animate(CurvedAnimation(
-                                                  parent: animation,
-                                                  curve: Curves.easeOutCubic,
-                                                )),
-                                                child: FadeTransition(
-                                                  opacity: animation,
-                                                  child: child,
-                                                ),
+                                              return FadeTransition(
+                                                opacity: animation,
+                                                child: child,
                                               );
                                             },
                                             child: activityLog.isNotEmpty
-                                                ? Text(
-                                                    activityLog.last,
+                                                ? _TypewriterText(
                                                     key: ValueKey<String>(activityLog.last + activityLog.length.toString()),
+                                                    text: activityLog.last,
                                                     textAlign: TextAlign.left,
+                                                    characterDuration: const Duration(milliseconds: 18),
                                                     style: TextStyle(
                                                       color: activityLogColor,
                                                       fontSize: isMobile
@@ -5490,22 +6332,43 @@ Widget build(BuildContext context) {
   clipBehavior: Clip.none,
   children: [
     AnimatedSwitcher(
-      duration: const Duration(milliseconds: 330),
+      duration: const Duration(milliseconds: 280),
       transitionBuilder: (Widget child,
           Animation<double> animation) {
-        return FadeTransition(
-          opacity: animation,
-          child: ScaleTransition(
-            scale:
-                Tween<double>(begin: 0.95, end: 1.0)
-                    .animate(animation),
-            child: child,
+        // Subtle downward placement animation
+        final slideAnimation = Tween<Offset>(
+          begin: const Offset(0, -0.065), // Start slightly above
+          end: Offset.zero,
+        ).animate(CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+        ));
+        
+        final scaleAnimation = Tween<double>(
+          begin: 1.02, // Start slightly larger (coming from above)
+          end: 1.0,
+        ).animate(CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+        ));
+        
+        return SlideTransition(
+          position: slideAnimation,
+          child: FadeTransition(
+            opacity: CurvedAnimation(
+              parent: animation,
+              curve: Curves.easeOut,
+            ),
+            child: ScaleTransition(
+              scale: scaleAnimation,
+              child: child,
+            ),
           ),
         );
       },
       child: field.isNotEmpty
           ? Container(
-              key: ValueKey(field.last),
+              key: ValueKey('${field.last}_${field.length}'), // Include length so same-value cards still animate
               width: fieldCardWidth,
               height: fieldCardHeight,
               decoration: BoxDecoration(
@@ -5539,7 +6402,8 @@ Widget build(BuildContext context) {
         ),
       ),
     // Prize win shine animation (player wins)
-    if (_showPrizeWinShine && field.isNotEmpty)
+    // Show the shine even when the field is empty (e.g. opponent timeout prize)
+    if (_showPrizeWinShine)
       Positioned.fill(
         child: _PrizeWinShine(
           width: fieldCardWidth,
@@ -5547,7 +6411,7 @@ Widget build(BuildContext context) {
         ),
       ),
     // Opponent win shine animation (dark grey)
-    if (_showOpponentWinShine && field.isNotEmpty)
+    if (_showOpponentWinShine)
       Positioned.fill(
         child: _OpponentWinShine(
           width: fieldCardWidth,
@@ -5693,7 +6557,10 @@ _TurnIndicatorContainer(
                                             ),
                                           ],
                                         ),
-                                        child: const CardWidget(isCardBack: true),
+                                        child: CardWidget(
+                                          isCardBack: true,
+                                          cardBackAsset: playerCardbackAssets[playerId] ?? CardWidget.defaultCardBackAsset,
+                                        ),
                                       ),
                                     ),
                                   ),
@@ -5731,10 +6598,12 @@ _TurnIndicatorContainer(
                     }
                   },
                   onLeaveRoom: () {
+                    // Ensure we leave the Firebase room and then
+                    // fully prepare the app for multiplayer/initial overlay state
                     _leaveRoom();
-                    setState(() {
-                      showInitialOverlay = true;
-                    });
+                    _prepareForMultiplayer();
+                    // Reinitialize underlying game state so the initial overlay shows a fresh game
+                    _setupGame(rotateBackground: false);
                   },
                 ),
               ),
@@ -5748,13 +6617,12 @@ _TurnIndicatorContainer(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                const Icon(
-                  Icons.content_cut_sharp,
+                const _LongPressGlowIcon(
+                  icon: Icons.content_cut_sharp,
                   size: 100,
-                  color: Color.fromARGB(255, 77, 104, 255),
-                  shadows: [
-                    Shadow(blurRadius: 12, color: Colors.indigo),
-                  ],
+                  baseColor: Color.fromARGB(255, 77, 104, 255),
+                  baseBlurRadius: 12,
+                  secondaryShadow: false,
                 ),
                 const SizedBox(height: 24),
                 const Text(
@@ -5782,9 +6650,8 @@ _TurnIndicatorContainer(
                     setState(() {
                       showInitialOverlay = false;
                     });
-                    if (gameMode == 'ai') {
-                      startTimer();
-                    }
+                    // Fully initialize a new game when Play is pressed
+                    _setupGame(rotateBackground: false);
                   },
                   child: const Text(
                     'Play',
@@ -5864,15 +6731,18 @@ _TurnIndicatorContainer(
                             crossAxisAlignment:
                                 CrossAxisAlignment.start,
                             children: [
-                              _buildRuleItem(
-                                  'Take turns playing cards against your opponent'),
-                              const SizedBox(height: 8),
-                              _buildRuleItem(
-                                  'Double or halve the last played card to win a point'),
-                              const SizedBox(height: 8),
-                              _buildRuleItem(
-                                  'Add or subtract your cards for strategic plays'),
-                              const SizedBox(height: 8),
+                                _buildRuleItem(
+                                  'Take turns playing card(s)'),
+                                const SizedBox(height: 12),
+                                _buildRuleItem(
+                                  'Try to double or halve the last played card'),
+                                const SizedBox(height: 12),
+                                _buildRuleItem(
+                                  '+ or - cards for strategic plays'),
+                                const SizedBox(height: 12),
+                                _buildRuleItemWithLink(
+                                  'Learn more', 'https://anthonyraad.github.io/8XGuide/'),
+                                const SizedBox(height: 12),
                             ],
                           ),
                         )
@@ -5904,14 +6774,378 @@ _TurnIndicatorContainer(
                   child: buildDifficultySelector(isMobile: isMobile),
                 ),
               ),
+          // Settings icon (only on initial overlay)
+          if (showInitialOverlay)
+            Positioned(
+              bottom: isMobile ? 18 : 28,
+              left: isMobile ? 15 : 30,
+              child: showSettings
+                  ? const SizedBox.shrink()
+                  : IconButton(
+                      icon: Icon(
+                        Icons.settings,
+                        shadows: [
+                          Shadow(
+                            color: Colors.black.withOpacity(0.6),
+                            blurRadius: 4,
+                            offset: Offset(1, 1),
+                          ),
+                        ],
+                      ),
+                      iconSize: 20,
+                      color: const Color.fromARGB(255, 0, 195, 255),
+                      tooltip: 'Settings',
+                      onPressed: () {
+                        setState(() {
+                          showSettings = true;
+                        });
+                      },
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                    ),
+            ),
+
+          // Settings modal
+          if (showSettings)
+            Positioned.fill(
+              child: Container(
+                color: Colors.transparent,
+                child: Center(
+                  child: Container(
+                    width: isMobile ? 320 : 420,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.grey[900],
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'Settings',
+                          style: TextStyle(
+                            fontFamily: 'Balatro',
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceAround,
+                          children: [
+                            Column(
+                              children: [
+                                Text(
+                                  'Total wins:',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontFamily: 'Balatro',
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '$totalWins',
+                                  style: const TextStyle(
+                                    color: Colors.blueAccent,
+                                    fontFamily: 'Balatro',
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            Column(
+                              children: [
+                                Text(
+                                  'Best Streak:',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontFamily: 'Balatro',
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '$highScore',
+                                  style: const TextStyle(
+                                    color: Colors.blueAccent,
+                                    fontFamily: 'Balatro',
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        CheckboxListTile(
+                          value: volumeEnabled,
+                          onChanged: (v) {
+                            setState(() {
+                              volumeEnabled = v ?? true;
+                              _applyVolumeSetting();
+                              _saveVolumeSetting();
+                            });
+                          },
+                          title: Text(
+                            'Volume',
+                            style: const TextStyle(color: Colors.white, fontFamily: 'Balatro'),
+                          ),
+                          controlAffinity: ListTileControlAffinity.trailing,
+                          activeColor: Colors.blueAccent,
+                        ),
+                        const SizedBox(height: 8),
+                        // Default Difficulty selection row
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              'Difficulty:',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontFamily: 'Balatro',
+                                fontSize: 14,
+                              ),
+                            ),
+                            DropdownButton<int>(
+                              value: defaultAiDifficulty,
+                              dropdownColor: Colors.grey[900],
+                              underline: const SizedBox.shrink(),
+                              items: [
+                                DropdownMenuItem(
+                                  value: 1,
+                                  child: Text(
+                                    'Dull',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontFamily: 'Balatro',
+                                    ),
+                                  ),
+                                ),
+                                DropdownMenuItem(
+                                  value: 2,
+                                  child: Text(
+                                    'Keen',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontFamily: 'Balatro',
+                                    ),
+                                  ),
+                                ),
+                                DropdownMenuItem(
+                                  value: 3,
+                                  child: Text(
+                                    'Sharp',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontFamily: 'Balatro',
+                                    ),
+                                  ),
+                                ),
+                              ],
+                              onChanged: (v) async {
+                                if (v == null) return;
+                                setState(() {
+                                  defaultAiDifficulty = v;
+                                  aiDifficulty = v; // Immediately reflect in selector
+                                });
+                                await _saveDefaultDifficulty();
+                              },
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              'Cardback:',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontFamily: 'Balatro',
+                                fontSize: 14,
+                              ),
+                            ),
+                            DropdownButton<String>(
+                              value: cardbackChoice,
+                              dropdownColor: Colors.grey[900],
+                              underline: const SizedBox.shrink(),
+                              items: ['Diamond', 'Onyx', 'Amber', 'Amethyst', 'Opal']
+                                  .map((name) {
+                                    final locked = (name == 'Opal' && !unlockedOpal) || (name == 'Amethyst' && !unlockedAmethyst) || (name == 'Amber' && !unlockedAmber) || (name == 'Onyx' && !unlockedOnyx);
+                                    return DropdownMenuItem(
+                                      value: name,
+                                      child: locked
+                                          ? Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Text(
+                                                  name,
+                                                  style: const TextStyle(
+                                                    color: Colors.grey,
+                                                    fontFamily: 'Balatro',
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 6),
+                                                const Icon(
+                                                  Icons.lock,
+                                                  size: 14,
+                                                  color: Colors.grey,
+                                                ),
+                                              ],
+                                            )
+                                          : Text(
+                                              name,
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontFamily: 'Balatro',
+                                              ),
+                                            ),
+                                    );
+                                  })
+                                  .toList(),
+                              onChanged: (v) async {
+                                if (v == null) return;
+                                // Prevent selecting locked options
+                                if (v == 'Opal' && !unlockedOpal) {
+                                  if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Reach a 10 winstreak to unlock.', style: const TextStyle(fontFamily: 'Balatro')),
+                                      behavior: SnackBarBehavior.floating,
+                                      backgroundColor: Colors.black87,
+                                      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                                      elevation: 6,
+                                      duration: const Duration(seconds: 2),
+                                    ),
+                                  );
+                                  return;
+                                }
+                                if (v == 'Amethyst' && !unlockedAmethyst) {
+                                  if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Reach a 7 winstreak to unlock.', style: const TextStyle(fontFamily: 'Balatro')),
+                                      behavior: SnackBarBehavior.floating,
+                                      backgroundColor: Colors.black87,
+                                      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                                      elevation: 6,
+                                      duration: const Duration(seconds: 2),
+                                    ),
+                                  );
+                                  return;
+                                }
+                                if (v == 'Amber' && !unlockedAmber) {
+                                  if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Reach a 5 winstreak to unlock.', style: const TextStyle(fontFamily: 'Balatro')),
+                                      behavior: SnackBarBehavior.floating,
+                                      backgroundColor: Colors.black87,
+                                      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                                      elevation: 6,
+                                      duration: const Duration(seconds: 2),
+                                    ),
+                                  );
+                                  return;
+                                }
+                                if (v == 'Onyx' && !unlockedOnyx) {
+                                  if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Reach a 3 winstreak to unlock.', style: const TextStyle(fontFamily: 'Balatro')),
+                                      behavior: SnackBarBehavior.floating,
+                                      backgroundColor: Colors.black87,
+                                      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                                      elevation: 6,
+                                      duration: const Duration(seconds: 2),
+                                    ),
+                                  );
+                                  return;
+                                }
+                                setState(() {
+                                  cardbackChoice = v;
+                                  if (v == 'Opal') {
+                                    selectedCardback = 'cardback5';
+                                    CardWidget.defaultCardBackAsset = 'assets/images/cardback5.png';
+                                  } else if (v == 'Amethyst') {
+                                    selectedCardback = 'cardback4';
+                                    CardWidget.defaultCardBackAsset = 'assets/images/cardback4.png';
+                                  } else if (v == 'Amber') {
+                                    selectedCardback = 'cardback3';
+                                    CardWidget.defaultCardBackAsset = 'assets/images/cardback3.png';
+                                  } else if (v == 'Onyx') {
+                                    selectedCardback = 'cardback2';
+                                    CardWidget.defaultCardBackAsset = 'assets/images/cardback2.png';
+                                  } else {
+                                    selectedCardback = 'cardback';
+                                    CardWidget.defaultCardBackAsset = 'assets/images/cardback.png';
+                                  }
+                                });
+                                await _saveCardbackChoice();
+                              },
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            IconButton(
+                              onPressed: () {
+                                setState(() {
+                                  showSettings = false;
+                                });
+                              },
+                              icon: const Icon(Icons.save),
+                              color: Colors.white,
+                              tooltip: 'Save',
+                            ),
+                          ],
+                        )
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
             Positioned(
               top: isMobile ? 20 : 30,
               left: isMobile ? 15 : 30,
-              child: Material(
-                color: Colors.transparent,
-                child: buildVersusButton(isMobile: isMobile),
+              child: AbsorbPointer(
+                absorbing: showSettings,
+                child: Material(
+                  color: Colors.transparent,
+                  child: buildVersusButton(isMobile: isMobile),
+                ),
               ),
             ),
+            // Persistent Exit button (visible except when on initial overlay)
+if (!showInitialOverlay)
+  Positioned(
+    // Nudge slightly to vertically align with the win-streak widget
+    bottom: isMobile ? 12 : 24,
+    left: isMobile ? 14 : 30,
+    child: IconButton(
+      icon: Icon(
+        Icons.home_filled,
+        shadows: const [
+          Shadow(
+            color: Color.fromARGB(197, 8, 8, 8),
+            blurRadius: 3,      // tight shadow
+            offset: Offset(0, 1),
+          ),
+        ],
+      ),
+      iconSize: isMobile ? 23 : 27,
+      color: const Color.fromARGB(220, 255, 255, 255),
+      tooltip: 'Exit to Menu',
+      onPressed: _handleGlobalExit,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(),
+      splashRadius: isMobile ? 16 : 18,
+    ),
+  ),
             if ((gameMode == 'ai' || gameMode == 'human') && !showInitialOverlay)
   Positioned(
     bottom: isMobile ? 20 : 30,
@@ -6057,6 +7291,7 @@ Widget _buildRuleItemWithLink(String text, String url) {
               color: const Color.fromARGB(255, 100, 181, 246),
               fontSize: 14,
               height: 1.4,
+              fontFamily: 'Balatro',
               decoration: TextDecoration.underline,
             ),
           ),
@@ -6198,6 +7433,7 @@ class AnimatedPrizeCardRow extends StatelessWidget {
   final bool isMobile;
   final bool isTablet;
   final bool isOpponent;
+  final String? cardBackAsset;
 
   const AnimatedPrizeCardRow({
     super.key,
@@ -6205,6 +7441,7 @@ class AnimatedPrizeCardRow extends StatelessWidget {
     required this.isMobile,
     required this.isTablet,
     this.isOpponent = false,
+    this.cardBackAsset,
   });
 
   @override
@@ -6218,6 +7455,7 @@ class AnimatedPrizeCardRow extends StatelessWidget {
           index: index,
           isMobile: isMobile,
           isTablet: isTablet,
+          cardBackAsset: cardBackAsset,
         ),
       ),
     );
@@ -6228,12 +7466,14 @@ class _AnimatedPrizeCardItem extends StatefulWidget {
   final int index;
   final bool isMobile;
   final bool isTablet;
+  final String? cardBackAsset;
 
   const _AnimatedPrizeCardItem({
     super.key,
     required this.index,
     required this.isMobile,
     required this.isTablet,
+    this.cardBackAsset,
   });
 
   @override
@@ -6308,7 +7548,10 @@ class _AnimatedPrizeCardItemState extends State<_AnimatedPrizeCardItem>
                       ),
                     ],
                   ),
-                  child: const CardWidget(isCardBack: true),
+                  child: CardWidget(
+                    isCardBack: true,
+                    cardBackAsset: widget.cardBackAsset ?? CardWidget.defaultCardBackAsset,
+                  ),
                 ),
               ),
             ),
@@ -6327,6 +7570,7 @@ class AnimatedModifierCard extends StatefulWidget {
   final bool isMobile;
   final bool isSmallPhone;
   final bool isSelected;
+  final String? cardBackAsset;
 
   const AnimatedModifierCard({
     super.key,
@@ -6337,6 +7581,7 @@ class AnimatedModifierCard extends StatefulWidget {
     required this.isMobile,
     this.isSmallPhone = false,
     this.isSelected = false,
+    this.cardBackAsset,
   });
 
   @override
@@ -6458,7 +7703,7 @@ class _AnimatedModifierCardState extends State<AnimatedModifierCard>
         child: ClipRRect(
           borderRadius: BorderRadius.circular(6),
           child: Image.asset(
-            'assets/images/cardback.png',
+            widget.cardBackAsset ?? CardWidget.defaultCardBackAsset,
             fit: BoxFit.cover,
             width: double.infinity,
             height: double.infinity,
@@ -6693,14 +7938,12 @@ class _GameOverOverlayState extends State<_GameOverOverlay>
                       opacity: _iconOpacityAnimation.value,
                       child: Transform.scale(
                         scale: _iconScaleAnimation.value,
-                        child: Icon(
-                          isWin ? Icons.diamond_sharp : Icons.heart_broken,
+                        child: _LongPressGlowIcon(
+                          icon: isWin ? Icons.diamond_sharp : Icons.heart_broken,
                           size: 120,
-                          color: accentColor,
-                          shadows: [
-                            Shadow(blurRadius: 16, color: accentColor),
-                            Shadow(blurRadius: 32, color: accentColor.withOpacity(0.5)),
-                          ],
+                          baseColor: accentColor,
+                          baseBlurRadius: 16,
+                          secondaryShadow: true,
                         ),
                       ),
                     ),
@@ -6740,26 +7983,6 @@ class _GameOverOverlayState extends State<_GameOverOverlay>
                   ],
                 ),
               ),
-              // Exit button for multiplayer
-              if (widget.gameMode == 'human')
-                Positioned(
-                  left: 16,
-                  bottom: 16,
-                  child: FadeTransition(
-                    opacity: _buttonOpacityAnimation,
-                    child: IconButton(
-                      icon: const Icon(Icons.exit_to_app),
-                      iconSize: 25,
-                      color: Colors.white60,
-                      tooltip: 'Back to Single Player',
-                      onPressed: widget.onLeaveRoom,
-                      style: IconButton.styleFrom(
-                        backgroundColor: Colors.black.withOpacity(0.3),
-                        padding: const EdgeInsets.all(10),
-                      ),
-                    ),
-                  ),
-                ),
             ],
           ),
         );
@@ -7619,4 +8842,172 @@ class _PaperTimerPainter extends CustomPainter {
   bool shouldRepaint(covariant _PaperTimerPainter oldDelegate) => 
       oldDelegate.secondsLeft != secondsLeft || 
       oldDelegate.isUrgent != isUrgent;
+}
+
+// Generic icon that glows brighter when long-pressed
+class _LongPressGlowIcon extends StatefulWidget {
+  final IconData icon;
+  final double size;
+  final Color baseColor;
+  final double baseBlurRadius;
+  final bool secondaryShadow;
+
+  const _LongPressGlowIcon({
+    required this.icon,
+    required this.size,
+    required this.baseColor,
+    this.baseBlurRadius = 12,
+    this.secondaryShadow = false,
+  });
+
+  @override
+  State<_LongPressGlowIcon> createState() => _LongPressGlowIconState();
+}
+
+class _LongPressGlowIconState extends State<_LongPressGlowIcon>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _luminosityAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 600),
+      reverseDuration: const Duration(milliseconds: 220),
+      vsync: this,
+    );
+
+    _luminosityAnimation = Tween<double>(begin: 0.0, end: 0.4).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onLongPressStart(LongPressStartDetails details) {
+    _controller.forward();
+  }
+
+  void _onLongPressEnd(LongPressEndDetails details) {
+    _controller.reverse();
+  }
+
+  Color _adjustLuminosity(Color color, double amount) {
+    final hsl = HSLColor.fromColor(color);
+    final newLightness = (hsl.lightness + amount).clamp(0.0, 1.0);
+    return hsl.withLightness(newLightness).toColor();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onLongPressStart: _onLongPressStart,
+      onLongPressEnd: _onLongPressEnd,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, child) {
+          final glowColor = _adjustLuminosity(widget.baseColor, _luminosityAnimation.value);
+          final List<Shadow> shadows = [
+            Shadow(
+              blurRadius: widget.baseBlurRadius + (_luminosityAnimation.value * 20),
+              color: glowColor.withOpacity(0.8),
+            ),
+          ];
+          if (widget.secondaryShadow) {
+            shadows.add(Shadow(
+              blurRadius: (widget.baseBlurRadius * 2) + (_luminosityAnimation.value * 30),
+              color: glowColor.withOpacity(0.5),
+            ));
+          }
+          return Icon(
+            widget.icon,
+            size: widget.size,
+            color: glowColor,
+            shadows: shadows,
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// A text widget that animates like it's being quickly typed out
+class _TypewriterText extends StatefulWidget {
+  final String text;
+  final TextStyle? style;
+  final TextAlign textAlign;
+  final Duration characterDuration;
+
+  const _TypewriterText({
+    super.key,
+    required this.text,
+    this.style,
+    this.textAlign = TextAlign.left,
+    this.characterDuration = const Duration(milliseconds: 25),
+  });
+
+  @override
+  State<_TypewriterText> createState() => _TypewriterTextState();
+}
+
+class _TypewriterTextState extends State<_TypewriterText>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  String _displayedText = '';
+  int _currentIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: widget.characterDuration,
+    );
+    _startTyping();
+  }
+
+  @override
+  void didUpdateWidget(_TypewriterText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text) {
+      // New text - reset and start typing again
+      _currentIndex = 0;
+      _displayedText = '';
+      _startTyping();
+    }
+  }
+
+  void _startTyping() {
+    if (_currentIndex < widget.text.length) {
+      Future.delayed(widget.characterDuration, () {
+        if (mounted && _currentIndex < widget.text.length) {
+          setState(() {
+            _currentIndex++;
+            _displayedText = widget.text.substring(0, _currentIndex);
+          });
+          _startTyping();
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      _displayedText,
+      style: widget.style,
+      textAlign: widget.textAlign,
+    );
+  }
 }

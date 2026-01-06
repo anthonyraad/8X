@@ -5,7 +5,7 @@
   "packages": [
     {
       "name": "scssrs",
-      "version": "1.0.1+10",
+      "version": "1.0.1+11",
       "dependencies": [
         "audioplayers",
         "cupertino_icons",

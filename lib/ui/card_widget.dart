@@ -5,6 +5,10 @@ class CardWidget extends StatelessWidget {
   final bool isJoker; // true if this is a joker card
   final bool isCardBack; // true if this is the card back
   final bool isPrize; // true if this is a prize card
+  final String? cardBackAsset; // optional per-instance card back asset
+
+  // Default asset used for card backs; can be changed at runtime.
+  static String defaultCardBackAsset = 'assets/images/cardback.png';
 
   const CardWidget({
     super.key,
@@ -12,6 +16,7 @@ class CardWidget extends StatelessWidget {
     this.isJoker = false,
     this.isCardBack = false,
     this.isPrize = false,
+    this.cardBackAsset,
   });
 
   @override
@@ -19,7 +24,7 @@ class CardWidget extends StatelessWidget {
     String assetName;
 
     if (isCardBack) {
-      assetName = 'assets/images/cardback.png';
+      assetName = cardBackAsset ?? CardWidget.defaultCardBackAsset;
     } else if (isPrize) {
       assetName = 'assets/images/prize.png';
     } else if (isJoker) {
