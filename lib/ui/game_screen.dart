@@ -2809,6 +2809,7 @@ void _checkAndUpdateHighScore() {
         Text(
           ': $winStreak',
           style: TextStyle(
+            fontFamily: 'Balatro',
             color: const Color.fromARGB(255, 58, 255, 196),
             fontWeight: FontWeight.bold,
             fontSize: isMobile ? 16 : 18,
@@ -2845,6 +2846,7 @@ Widget buildHighScore({required bool isMobile}) {
       Text(
         ': $highScore',
         style: TextStyle(
+          fontFamily: 'Balatro',
           color: Color.fromARGB(255, 0, 195, 255),
           fontWeight: FontWeight.bold,
           fontSize: isMobile ? 16 : 18,
