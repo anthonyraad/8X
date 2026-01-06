@@ -3585,17 +3585,15 @@ void _handleSwipeUpModifier(String modifierType) async {
       isPlayerTurn = false;
       gameOver = true;
       winner = 'player';
-      // Update win streak only for single-player (AI) mode.
+      // Update win streak only for single-player (AI) mode on Sharp difficulty.
       // Multiplayer win streaks are tracked via Firebase and should NOT
       // affect the global high score or unlocks.
-      if (gameMode != 'human') {
+      // Win streaks and cardback unlocks are ONLY for Sharp difficulty (aiDifficulty == 3)
+      if (gameMode != 'human' && aiDifficulty == 3) {
         winStreak += 1;
         _checkAndUpdateHighScore();
-        // Increment total wins for sharp difficulty (difficulty 3)
-        if (aiDifficulty == 3) {
-          totalWins += 1;
-          _saveTotalWins(totalWins);
-        }
+        totalWins += 1;
+        _saveTotalWins(totalWins);
       }
       clearSelections();
     });
@@ -3936,10 +3934,11 @@ Future<void> playOpponentPrizeCardSound() async {
               multiplayerWinStreaks[entry.key as String] = entry.value as int? ?? 0;
             }
             
-            // FIX: Also update the local winStreak variable for UI display
+            // Update the local winStreak variable for UI display only
+            // NOTE: Multiplayer streaks do NOT affect high score or cardback unlocks
+            // Those are reserved for Sharp difficulty AI wins only
             if (playerId != null && multiplayerWinStreaks.containsKey(playerId)) {
               winStreak = multiplayerWinStreaks[playerId]!;
-              _checkAndUpdateHighScore();
             }
           });
         }
