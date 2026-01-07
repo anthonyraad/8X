@@ -8187,46 +8187,62 @@ class _PlayButton extends StatefulWidget {
 }
 
 class _PlayButtonState extends State<_PlayButton>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-  late Animation<double> _scaleAnimation;
+    with TickerProviderStateMixin {
+  late AnimationController _pressController;
+  late AnimationController _entranceController;
+  late Animation<double> _pressScaleAnimation;
+  late Animation<double> _entranceScaleAnimation;
   bool _isPressed = false;
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(
+    // Press animation controller
+    _pressController = AnimationController(
       duration: const Duration(milliseconds: 100),
       vsync: this,
     );
-    _scaleAnimation = Tween<double>(begin: 1.0, end: 0.92).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+    _pressScaleAnimation = Tween<double>(begin: 1.0, end: 0.92).animate(
+      CurvedAnimation(parent: _pressController, curve: Curves.easeInOut),
     );
+    
+    // Entrance animation controller - grows from nothing
+    _entranceController = AnimationController(
+      duration: const Duration(milliseconds: 200),
+      vsync: this,
+    );
+    _entranceScaleAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _entranceController, curve: Curves.easeOutBack),
+    );
+    
+    // Start entrance animation
+    _entranceController.forward();
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _pressController.dispose();
+    _entranceController.dispose();
     super.dispose();
   }
 
   void _handleTapDown(TapDownDetails details) {
     if (widget.canPlay) {
       setState(() => _isPressed = true);
-      _controller.forward();
+      _pressController.forward();
     }
   }
 
   void _handleTapUp(TapUpDetails details) {
     if (_isPressed) {
-      _controller.reverse();
+      _pressController.reverse();
       setState(() => _isPressed = false);
     }
   }
 
   void _handleTapCancel() {
     if (_isPressed) {
-      _controller.reverse();
+      _pressController.reverse();
       setState(() => _isPressed = false);
     }
   }
@@ -8235,16 +8251,16 @@ class _PlayButtonState extends State<_PlayButton>
   Widget build(BuildContext context) {
     final double imageSize = widget.isSmallPhone ? 40 : (widget.isMobile ? 55 : (widget.isTablet ? 50 : 60));
     
-    return GestureDetector(
-      onTapDown: _handleTapDown,
-      onTapUp: _handleTapUp,
-      onTapCancel: _handleTapCancel,
-      onTap: widget.canPlay ? widget.onPressed : null,
-      child: AnimatedBuilder(
-        animation: _controller,
-        builder: (context, child) {
-          return Transform.scale(
-            scale: _scaleAnimation.value,
+    return AnimatedBuilder(
+      animation: Listenable.merge([_pressController, _entranceController]),
+      builder: (context, child) {
+        return Transform.scale(
+          scale: _entranceScaleAnimation.value * _pressScaleAnimation.value,
+          child: GestureDetector(
+            onTapDown: _handleTapDown,
+            onTapUp: _handleTapUp,
+            onTapCancel: _handleTapCancel,
+            onTap: widget.canPlay ? widget.onPressed : null,
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 150),
               decoration: BoxDecoration(
@@ -8269,9 +8285,9 @@ class _PlayButtonState extends State<_PlayButton>
                 ),
               ),
             ),
-          );
-        },
-      ),
+          ),
+        );
+      },
     );
   }
 }
