@@ -5536,33 +5536,25 @@ void _instantPlayCard(int index) async {
       child: Container(
         margin: EdgeInsets.symmetric(horizontal: opSpacing),
         padding: EdgeInsets.symmetric(
-          horizontal: 0,
-          vertical: isSmallPhone ? 2 : (isMobile ? 4 : 8),
+          horizontal: isSmallPhone ? 4 : (isMobile ? 6 : 8),
+          vertical: isSmallPhone ? 4 : (isMobile ? 6 : 8),
         ),
         decoration: BoxDecoration(
-          color: Colors.black,
-          borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: Colors.greenAccent, width: 2),
+          borderRadius: BorderRadius.circular(8),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.4),
+              blurRadius: 8,
+              offset: const Offset(2, 4),
+              spreadRadius: 1,
+            ),
+          ],
         ),
-        alignment: Alignment.center,
-        constraints: BoxConstraints(
-    minWidth: isSmallPhone ? 40 : (isMobile ? 50 : 60),  // Give it a minimum width
-  ),
-        child: Text(
-          selectedOps[i],
-          style: TextStyle(
-            fontFamily: 'Balatro',
-            fontSize: isSmallPhone ? 32 : (isMobile ? 48 : (isTablet ? 48 : 60)),
-            color: const Color.fromARGB(255, 104, 255, 210),
-            fontWeight: FontWeight.bold,
-            shadows: const [
-              Shadow(
-                blurRadius: 4,
-                color: Color.fromARGB(255, 218, 251, 255),
-                offset: Offset(0, 0),
-              ),
-            ],
-          ),
+        child: Image.asset(
+          selectedOps[i] == '+' ? 'assets/images/plus.png' : 'assets/images/minus.png',
+          width: isSmallPhone ? 40 : (isMobile ? 55 : (isTablet ? 50 : 60)),
+          height: isSmallPhone ? 40 : (isMobile ? 55 : (isTablet ? 50 : 60)),
+          fit: BoxFit.contain,
         ),
       ),
     ),
@@ -8198,7 +8190,6 @@ class _PlayButtonState extends State<_PlayButton>
     with SingleTickerProviderStateMixin {
   late AnimationController _controller;
   late Animation<double> _scaleAnimation;
-  late Animation<double> _glowAnimation;
   bool _isPressed = false;
 
   @override
@@ -8209,9 +8200,6 @@ class _PlayButtonState extends State<_PlayButton>
       vsync: this,
     );
     _scaleAnimation = Tween<double>(begin: 1.0, end: 0.92).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
-    );
-    _glowAnimation = Tween<double>(begin: 8.0, end: 2.0).animate(
       CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
     );
   }
@@ -8245,10 +8233,13 @@ class _PlayButtonState extends State<_PlayButton>
 
   @override
   Widget build(BuildContext context) {
+    final double imageSize = widget.isSmallPhone ? 40 : (widget.isMobile ? 55 : (widget.isTablet ? 50 : 60));
+    
     return GestureDetector(
       onTapDown: _handleTapDown,
       onTapUp: _handleTapUp,
       onTapCancel: _handleTapCancel,
+      onTap: widget.canPlay ? widget.onPressed : null,
       child: AnimatedBuilder(
         animation: _controller,
         builder: (context, child) {
@@ -8257,50 +8248,24 @@ class _PlayButtonState extends State<_PlayButton>
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 150),
               decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                boxShadow: widget.canPlay
-                    ? [
-                        BoxShadow(
-                          color: const Color.fromARGB(255, 123, 207, 255)
-                              .withOpacity(_isPressed ? 0.3 : 0.6),
-                          blurRadius: _glowAnimation.value,
-                          spreadRadius: _isPressed ? 0 : 2,
-                        ),
-                      ]
-                    : null,
-              ),
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: widget.canPlay
-                      ? const Color.fromARGB(30, 100, 180, 255)
-                      : const Color.fromARGB(5, 194, 194, 194),
-                  shape: const CircleBorder(),
-                  padding: EdgeInsets.all(widget.isSmallPhone ? 8 : (widget.isMobile ? 12 : 18)),
-                  elevation: _isPressed ? 2 : 8,
-                  shadowColor: const Color.fromARGB(255, 123, 207, 255),
-                ),
-                onPressed: widget.onPressed,
-                child: Text(
-  '=',
-  textAlign: TextAlign.center,
-  style: TextStyle(
-    fontFamily: 'Balatro',
-    fontSize: widget.isSmallPhone ? 28 : (widget.isMobile ? 42 : (widget.isTablet ? 28 : 34)),
-    color: widget.canPlay
-        ? const Color.fromARGB(255, 237, 227, 240)
-        : const Color.fromARGB(100, 237, 227, 240),
-    fontWeight: FontWeight.bold,
-    height: 1.0,  // Add this to remove extra line height
-    shadows: [
-      Shadow(
-        blurRadius: widget.canPlay ? 8 : 4,
-        color: widget.canPlay
-            ? const Color.fromARGB(222, 219, 242, 255)
-            : const Color.fromARGB(100, 219, 242, 255),
-        offset: const Offset(0, 0),
-                      ),
-                    ],
+                borderRadius: BorderRadius.circular(8),
+                // Same shadow style as field cards
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(_isPressed ? 0.25 : 0.4),
+                    blurRadius: _isPressed ? 4 : 8,
+                    offset: Offset(_isPressed ? 1 : 2, _isPressed ? 2 : 4),
+                    spreadRadius: _isPressed ? 0 : 1,
                   ),
+                ],
+              ),
+              child: Opacity(
+                opacity: widget.canPlay ? 1.0 : 0.4,
+                child: Image.asset(
+                  'assets/images/equal.png',
+                  width: imageSize,
+                  height: imageSize,
+                  fit: BoxFit.contain,
                 ),
               ),
             ),
