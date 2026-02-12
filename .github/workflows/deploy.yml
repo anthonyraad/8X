@@ -35,10 +35,16 @@ jobs:
       - name: Build web
         run: flutter build web --base-href /8X/
 
-      - name: Fix base href for GitHub Pages
+      - name: Fix base href and asset paths for GitHub Pages
         run: |
+          # Fix base tag
           sed -i 's|<base href="[^"]*">|<base href="/8X/">|' build/web/index.html
-          grep -E '<base href=' build/web/index.html
+          # Use absolute paths for critical assets (ensures correct loading regardless of base tag timing)
+          sed -i 's|src="flutter_bootstrap.js"|src="/8X/flutter_bootstrap.js"|g' build/web/index.html
+          sed -i 's|href="favicon.png"|href="/8X/favicon.png"|g' build/web/index.html
+          sed -i 's|href="manifest.json"|href="/8X/manifest.json"|g' build/web/index.html
+          sed -i 's|href="icons/Icon-192.png"|href="/8X/icons/Icon-192.png"|g' build/web/index.html
+          grep -E '<base href=|flutter_bootstrap|favicon|manifest' build/web/index.html
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
