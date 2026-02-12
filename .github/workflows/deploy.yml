@@ -35,6 +35,11 @@ jobs:
       - name: Build web
         run: flutter build web --base-href /8X/
 
+      - name: Fix base href for GitHub Pages
+        run: |
+          sed -i 's|<base href="[^"]*">|<base href="/8X/">|' build/web/index.html
+          grep -E '<base href=' build/web/index.html
+
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
