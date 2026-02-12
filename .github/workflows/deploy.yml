@@ -3,6 +3,14 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+    paths:
+      - 'lib/**'
+      - 'web/**'
+      - 'assets/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - '.github/workflows/deploy.yml'
+      - '!docs/**'
   workflow_dispatch:
 
 jobs:
@@ -25,14 +33,17 @@ jobs:
         run: flutter pub get
 
       - name: Build web
-        run: flutter build web --base-href /8x/
+        run: flutter build web --base-href /8X/
 
-      - name: Deploy to GitHub Pages
+      - name: Deploy to docs folder (main branch)
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: main
           publish_dir: ./build/web
-          force_orphan: true
+          destination_dir: docs
+          force_orphan: false
+          keep_files: false
           user_name: github-actions[bot]
           user_email: github-actions[bot]@users.noreply.github.com
           commit_message: Deploy web build ${{ github.sha }}
