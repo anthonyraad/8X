@@ -13,11 +13,21 @@ on:
       - '!docs/**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout
@@ -54,20 +64,14 @@ jobs:
           sed -i 's|href="icons/Icon-192.png"|href="/8X/icons/Icon-192.png"|g' build/web/index.html
           grep -E '<base href=|flutter_bootstrap|favicon|manifest' build/web/index.html
 
-      - name: Deploy web build to repo root (GitHub Pages source)
-        run: |
-          cp build/web/index.html build/web/version.json build/web/main.dart.js build/web/manifest.json build/web/favicon.png .
-          cp build/web/flutter.js build/web/flutter_bootstrap.js build/web/flutter_service_worker.js .
-          rm -rf canvaskit icons
-          cp -r build/web/canvaskit build/web/icons .
-          cp build/web/assets/AssetManifest.* build/web/assets/FontManifest.json build/web/assets/NOTICES assets/
-          rm -rf assets/assets assets/packages assets/shaders
-          cp -r build/web/assets/assets build/web/assets/packages build/web/assets/shaders assets/
-          find build/web/assets/fonts -maxdepth 1 -type f -exec cp {} assets/fonts/ \;
-          cp -r build/web/* docs/
-          touch .nojekyll docs/.nojekyll
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add index.html version.json main.dart.js manifest.json favicon.png flutter.js flutter_bootstrap.js flutter_service_worker.js canvaskit icons assets/AssetManifest.bin assets/AssetManifest.bin.json assets/AssetManifest.json assets/FontManifest.json assets/NOTICES assets/assets assets/fonts assets/packages assets/shaders docs/ .nojekyll
-          git diff --staged --quiet && echo "No web changes to commit" || git commit -m "Deploy web build ${{ github.sha }}"
-          git push
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
