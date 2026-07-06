@@ -1,7 +1,7 @@
 name: scssrs
-description: A new Flutter project.
+description: 8X Card Game
 publish_to: 'none'
-version: 1.0.1+11
+version: 1.0.1+17
 
 environment:
   sdk: '>=3.0.0 <4.0.0'

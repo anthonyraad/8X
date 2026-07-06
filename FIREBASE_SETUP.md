@@ -16,3 +16,19 @@ Create `lib/firebase_options.dart` using one of these methods:
 3. Value: The full contents of your `lib/firebase_options.dart` file (copy the entire file)
 
 The deploy workflow will inject this before building the web app.
+
+## Arcade Leaderboard (Realtime Database)
+
+The arcade leaderboard uses Firebase Realtime Database. Add an index on `score` for the `arcadeLeaderboard` node so queries work correctly. In Firebase Console → Realtime Database → Rules, ensure your rules allow read/write for authenticated users (or your security model), and add:
+
+```json
+{
+  "rules": {
+    "arcadeLeaderboard": {
+      ".indexOn": ["score"]
+    }
+  }
+}
+```
+
+Or add the index via Firebase Console → Realtime Database → Indexes.

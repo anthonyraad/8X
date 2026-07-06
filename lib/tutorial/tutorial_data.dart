@@ -169,7 +169,7 @@ final List<TutorialStep> tutorialSteps = [
     stepNumber: 11,
     instructionText: "Victory! You're ready to play.",
     playerHandOverride: [],
-    fieldStateOverride: ['4', '5', '10', 'a', '2', '4', '8'],
+    fieldStateOverride: ['4', '5', '10', 'a', '2', '4', '4'],
     highlightRegion: HighlightRegion.none,
     requiredAction: RequiredAction.triggerVictory,
     expectedPrizeCount: 0, // Won all prizes
