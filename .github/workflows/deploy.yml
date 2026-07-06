@@ -61,8 +61,9 @@ jobs:
           rm -rf canvaskit icons
           cp -r build/web/canvaskit build/web/icons .
           cp build/web/assets/AssetManifest.* build/web/assets/FontManifest.json build/web/assets/NOTICES assets/
-          rm -rf assets/assets assets/fonts assets/packages assets/shaders
-          cp -r build/web/assets/assets build/web/assets/fonts build/web/assets/packages build/web/assets/shaders assets/
+          rm -rf assets/assets assets/packages assets/shaders
+          cp -r build/web/assets/assets build/web/assets/packages build/web/assets/shaders assets/
+          find build/web/assets/fonts -maxdepth 1 -type f -exec cp {} assets/fonts/ \;
           cp -r build/web/* docs/
           touch .nojekyll docs/.nojekyll
           git config user.name "github-actions[bot]"
