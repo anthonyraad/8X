@@ -50,7 +50,6 @@ android/local.properties
 *.keystore
 *.jks
 
-# Firebase config (contains API keys)
+# Native Firebase config files (not needed for web; keep out of git)
 android/app/google-services.json
 ios/Runner/GoogleService-Info.plist
-lib/firebase_options.dart
