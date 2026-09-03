@@ -65,8 +65,7 @@ final List<TutorialStep> tutorialSteps = [
     instructionText: "Start by playing a card.\n\nTry swiping up on the 4!",
     playerHandOverride: ['4', '5'],
     fieldStateOverride: [],
-    highlightRegion: HighlightRegion.cardInHand,
-    highlightCardValue: '4',
+    highlightRegion: HighlightRegion.none,
     requiredAction: RequiredAction.swipeUpCard4,
     opponentPlaysCard: '5', // Opponent plays 5 after player plays
     expectedPrizeCount: 3,
