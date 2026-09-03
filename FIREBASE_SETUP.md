@@ -1,21 +1,19 @@
 # Firebase Setup
 
-The Firebase API key is not stored in the repository to avoid exposure in public source code.
+`lib/firebase_options.dart` is committed. Firebase web API keys are client-side by design (they ship in the compiled JS). Restrict the key in Google Cloud (HTTP referrers for `anthonyraad.github.io`) and rely on Auth + Realtime Database rules.
+
+Native files `android/app/google-services.json` and `ios/Runner/GoogleService-Info.plist` stay gitignored.
 
 ## Local Development
 
-Create `lib/firebase_options.dart` using one of these methods:
+If you need to regenerate options:
 
 1. **Recommended:** Run `flutterfire configure` (requires [FlutterFire CLI](https://firebase.flutter.dev/docs/cli/))
-2. **Manual:** Copy `lib/firebase_options.dart.example` to `lib/firebase_options.dart` and replace the placeholder values with your Firebase project config from the [Firebase Console](https://console.firebase.google.com/)
+2. **Manual:** Copy `lib/firebase_options.dart.example` and fill in values from the [Firebase Console](https://console.firebase.google.com/)
 
-## GitHub Actions (Web Deploy)
+## GitHub Pages
 
-1. Go to your repo **Settings** → **Secrets and variables** → **Actions**
-2. Add a new secret: **FIREBASE_OPTIONS_DART**
-3. Value: The full contents of your `lib/firebase_options.dart` file (copy the entire file)
-
-The deploy workflow will inject this before building the web app.
+The deploy workflow builds with `--base-href="/8X/"` and publishes `build/web`. No Actions secret is required for Firebase.
 
 ## Arcade Leaderboard (Realtime Database)
 

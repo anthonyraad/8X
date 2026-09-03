@@ -3,14 +3,8 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
-    paths:
-      - 'lib/**'
-      - 'web/**'
-      - 'assets/**'
-      - 'pubspec.yaml'
-      - 'pubspec.lock'
-      - '.github/workflows/deploy.yml'
-      - '!docs/**'
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -20,58 +14,45 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
-  deploy:
-    runs-on: ubuntu-22.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
+  build:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Inject Firebase config
-        env:
-          FIREBASE_OPTIONS_DART: ${{ secrets.FIREBASE_OPTIONS_DART }}
-        run: |
-          if [ -z "$FIREBASE_OPTIONS_DART" ]; then
-            echo "::error::FIREBASE_OPTIONS_DART secret not set. Add it in Settings > Secrets and variables > Actions"
-            exit 1
-          fi
-          printf '%s' "$FIREBASE_OPTIONS_DART" > lib/firebase_options.dart
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Get dependencies
-        run: flutter pub get
+      - run: flutter pub get
 
       - name: Build web
-        run: flutter build web --base-href /8X/
+        run: flutter build web --release --base-href="/8X/"
 
-      - name: Fix base href and asset paths for GitHub Pages
+      - name: Verify base href for GitHub Pages
         run: |
-          sed -i 's|<base href="[^"]*">|<base href="/8X/">|' build/web/index.html
-          sed -i 's|src="flutter_bootstrap.js"|src="/8X/flutter_bootstrap.js"|g' build/web/index.html
-          sed -i 's|href="favicon.png"|href="/8X/favicon.png"|g' build/web/index.html
-          sed -i 's|href="manifest.json"|href="/8X/manifest.json"|g' build/web/index.html
-          sed -i 's|href="icons/Icon-192.png"|href="/8X/icons/Icon-192.png"|g' build/web/index.html
+          if ! grep -q '<base href="/8X/">' build/web/index.html; then
+            echo "::error::Expected <base href=\"/8X/\"> in build/web/index.html so assets resolve under /8X/"
+            grep -n -E '<base href=|flutter_bootstrap' build/web/index.html || true
+            exit 1
+          fi
           grep -E '<base href=|flutter_bootstrap|favicon|manifest' build/web/index.html
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: build/web
 
-      - name: Deploy to GitHub Pages
-        id: deployment
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
         uses: actions/deploy-pages@v4
