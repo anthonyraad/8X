@@ -2,7 +2,7 @@
 
 `lib/firebase_options.dart` is committed. Firebase web API keys are client-side by design (they ship in the compiled JS). Restrict the key in Google Cloud (HTTP referrers for `anthonyraad.github.io`) and rely on Auth + Realtime Database rules.
 
-Native files `android/app/google-services.json` and `ios/Runner/GoogleService-Info.plist` stay gitignored.
+Native files `android/app/google-services.json` and `ios/Runner/GoogleService-Info.plist` stay gitignored. Android client values for `com.raadscapes.scssrs` live in `lib/firebase_options.dart` (`:android:` app id + Android API key) so release AABs can initialize without relying on a local json file at runtime.
 
 ## Local Development
 

@@ -1,5 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'ui/game_screen.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -15,22 +17,25 @@ void main() async {
     DeviceOrientation.portraitDown,
   ]);
 
-  // On web, we need to pass options. On Android/iOS, google-services.json handles it.
-  if (kIsWeb) {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-  } else {
-    // Check if already initialized (by google-services.json)
-    if (Firebase.apps.isEmpty) {
-      await Firebase.initializeApp();
-    }
-  }
-  
-  // Sign in anonymously
-  await FirebaseAuth.instance.signInAnonymously();
-  
+  // Do not block the first frame on Firebase. A hang or throw here leaves the
+  // Android splash up (white/black) and looks like the app never opens.
   runApp(const MyApp());
+  unawaited(_initFirebaseInBackground());
+}
+
+Future<void> _initFirebaseInBackground() async {
+  try {
+    if (Firebase.apps.isEmpty) {
+      await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform,
+      ).timeout(const Duration(seconds: 8));
+    }
+    await FirebaseAuth.instance
+        .signInAnonymously()
+        .timeout(const Duration(seconds: 8));
+  } catch (e, st) {
+    debugPrint('Firebase startup failed (AI / local play still works): $e\n$st');
+  }
 }
 
 class MyApp extends StatelessWidget {
