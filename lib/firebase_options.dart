@@ -43,10 +43,12 @@ class DefaultFirebaseOptions {
     measurementId: 'G-7PP1XZ6GJS',
   );
 
-  // Android uses google-services.json, but we provide fallback
+  // From the last tracked android/app/google-services.json for
+  // com.raadscapes.scssrs (removed from git in 4690ad8). Do not reuse the
+  // web appId/apiKey here — that makes Android Firebase.initializeApp fail.
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyAMEqonrFeWjQsn0nBBbjRLgaVeY6-N9g0',
-    appId: '1:763109943495:web:893100513b9c5ef1f9f6e2',
+    apiKey: 'AIzaSyDcWK7ZZWziGfMBu9j5IQMxVEgi6jR5mck',
+    appId: '1:763109943495:android:7ee914140c4e6624f9f6e2',
     messagingSenderId: '763109943495',
     projectId: 'x-multiplayer',
     databaseURL: 'https://x-multiplayer-default-rtdb.firebaseio.com',
